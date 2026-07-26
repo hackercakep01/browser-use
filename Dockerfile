@@ -82,16 +82,16 @@ RUN echo 'Binary::apt::APT::Keep-Downloaded-Packages "1";' > /etc/apt/apt.conf.d
     && rm -f /etc/apt/apt.conf.d/docker-clean
 
 # Print debug info about build and save it to disk, for human eyes only, not used by anything else
-RUN (echo "[i] Docker build for Browser Use $(cat /VERSION.txt) starting..." \
+RUN (echo "[i] Docker build for Browser Use $(cat /VERSION.txt 2>/dev/null || echo "0.13.6") starting..." \
     && echo "PLATFORM=${TARGETPLATFORM} ARCH=$(uname -m) ($(uname -s) ${TARGETARCH} ${TARGETVARIANT})" \
     && echo "BUILD_START_TIME=$(date +"%Y-%m-%d %H:%M:%S %s") TZ=${TZ} LANG=${LANG}" \
     && echo \
     && echo "CODE_DIR=${CODE_DIR} DATA_DIR=${DATA_DIR} PATH=${PATH}" \
     && echo \
     && uname -a \
-    && cat /etc/os-release | head -n7 \
-    && which bash && bash --version | head -n1 \
-    && which dpkg && dpkg --version | head -n1 \
+    && sed -n '1,7p' /etc/os-release \
+    && which bash && bash --version \
+    && which dpkg && dpkg --version \
     && echo -e '\n\n' && env && echo -e '\n\n' \
     && which python && python --version \
     && which pip && pip --version \
@@ -204,10 +204,12 @@ RUN mkdir -p "$DATA_DIR/profiles/default" \
 
 USER "$BROWSERUSE_USER"
 VOLUME "$DATA_DIR"
+EXPOSE 8000
 EXPOSE 9242
 EXPOSE 9222
 
-# HEALTHCHECK --interval=30s --timeout=20s --retries=15 \
-#     CMD curl --silent 'http://localhost:8000/health/' | grep -q 'OK'
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
 
 ENTRYPOINT ["browser-use"]
+CMD ["server"]

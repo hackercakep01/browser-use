@@ -80,6 +80,20 @@ def _run_cli_mcp_server() -> None:
 	_run_mcp_stdio_server('browser_use.mcp.cli_mcp')
 
 
+def _run_web_api_server(argv: list[str]) -> int:
+	import argparse
+	import os
+	from browser_use.server.app import start_server
+
+	parser = argparse.ArgumentParser(description='Start Browser-Use Web API Server')
+	parser.add_argument('--host', default=os.environ.get('HOST', '0.0.0.0'), help='Host IP to bind (default: 0.0.0.0)')
+	parser.add_argument('--port', type=int, default=int(os.environ.get('PORT', 8000)), help='Port to bind (default: 8000)')
+	parsed_args = parser.parse_args(argv)
+
+	start_server(host=parsed_args.host, port=parsed_args.port)
+	return 0
+
+
 def _run_install_command(argv: list[str]) -> int:
 	if any(arg in {'-h', '--help'} for arg in argv):
 		print('usage: browser-use install')
@@ -340,6 +354,8 @@ def _command_name(args: list[str]) -> str:
 		return 'cli-mcp'
 	if '--mcp' in args:
 		return 'mcp'
+	if args and args[0] in {'server', '--server'}:
+		return 'server'
 	if args and args[0] == 'install':
 		return 'install'
 	if args and args[0] == 'init':
@@ -361,6 +377,8 @@ def _dispatch(args: list[str]) -> tuple[int | None, str]:
 	if '--mcp' in args:
 		_run_mcp_server()
 		return 0, 'mcp'
+	if args and args[0] in {'server', '--server'}:
+		return _run_web_api_server(args[1:]), 'server'
 	if args and args[0] == 'install':
 		return _run_install_command(args[1:]), 'install'
 	if args and args[0] == 'init':

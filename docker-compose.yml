@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  browser-use:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: browseruse/browseruse:latest
+    container_name: browser-use
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+      - "9242:9242"
+    environment:
+      - PORT=8000
+      - HOST=0.0.0.0
+      - BROWSER_USE_API_KEY=${BROWSER_USE_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      - browser-use-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  browser-use-data:
+    driver: local

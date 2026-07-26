@@ -47,6 +47,8 @@ dependencies = [
     "python-docx==1.2.0",
     "browser-use-sdk==3.4.2",
     "browser-harness==0.1.6",
+    "fastapi==0.128.0",
+    "uvicorn==0.40.0",
 ]
 # google-api-core: only used for Google LLM APIs
 # pyperclip: only used for examples that use copy/paste
@@ -106,6 +108,7 @@ browseruse = "browser_use.cli:main"  # Alias for browser-use
 bu = "browser_use.cli:main"  # Alias for browser-use
 browser = "browser_use.cli:main"  # Alias for browser-use
 browser-use-tui = "browser_use.cli:browser_use_tui_main"  # Deprecated alias for browser-use
+browser-use-server = "browser_use.server.app:start_server"  # FastAPI Web Server for Easypanel
 
 [build-system]
 requires = ["hatchling"]
