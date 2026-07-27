@@ -54,20 +54,36 @@ Panduan ini mejelaskan cara men-deploy **Browser-Use** pada server Anda mengguna
 
 ---
 
+## 🔀 Integrasi 9router / Custom OpenAI Endpoint
+
+Browser-Use telah dilengkapi dengan dukungan penuh untuk **9router** dan Custom OpenAI-compatible API Gateway:
+
+1. Buka Web UI Dashboard di `http://<your-easypanel-domain-or-ip>:8000/`.
+2. Di bagian **LLM Model Provider**, pilih **9router / Custom OpenAI Compatible Endpoint**.
+3. Masukkan **API Base URL** Anda (contoh: `https://terbaik-9router.3obhmi.easypanel.host/v1`).
+4. Klik tombol **📥 Import Models** untuk secara otomatis mengambil dan mengimpor daftar model AI yang tersedia dari 9router Anda.
+5. Pilih model yang diimpor dari dropdown dan jalankan tugas browser automation!
+
+### Contoh Payload REST API dengan 9router:
+```json
+{
+  "task": "Extract top posts summary from Hacker News",
+  "llm_provider": "9router",
+  "api_base_url": "https://terbaik-9router.3obhmi.easypanel.host/v1",
+  "model_name": "gpt-4o",
+  "api_key": "your_9router_api_key_optional"
+}
+```
+
+---
+
 ## 🔍 Verification & Health Check
 
-Setalah status service berubah menjadi **Healthy**:
+Setelah status service berubah menjadi **Healthy**:
 - **Health Check Endpoint**: `http://<your-easypanel-domain-or-ip>:8000/health`
 - **Web UI Dashboard**: Buka `http://<your-easypanel-domain-or-ip>:8000/` di browser untuk mengakses Dashboard Browser-Use interaktif.
-- **REST API Endpoint**:
-  - `POST /api/v1/run` untuk menjalankan automation task via JSON API:
-    ```json
-    {
-      "task": "Find top 1 post on Hacker News",
-      "llm_provider": "browser_use",
-      "use_cloud": false
-    }
-    ```
+- **Import Models API Endpoint**: `POST /api/v1/models`
+- **Run Task API Endpoint**: `POST /api/v1/run`
 
 ---
 
