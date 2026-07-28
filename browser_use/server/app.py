@@ -354,14 +354,6 @@ async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
 	)
 
 
-@app.get("/api/v1/tasks/{task_id}", response_model=TaskStatusResponse, summary="Get Task Status")
-async def get_task_status(task_id: str):
-	"""Get status and output results of a specific task."""
-	if task_id not in tasks_db:
-		raise HTTPException(status_code=404, detail="Task ID not found")
-	return TaskStatusResponse(**tasks_db[task_id])
-
-
 @app.get("/api/v1/tasks", summary="List All Tasks with Optional Date Range & Status Filtering")
 async def list_tasks(
 	start_date: Optional[str] = None,
@@ -391,6 +383,14 @@ async def export_tasks_json(
 		media_type="application/json",
 		headers={"Content-Disposition": f'attachment; filename="{filename}"'},
 	)
+
+
+@app.get("/api/v1/tasks/{task_id}", response_model=TaskStatusResponse, summary="Get Task Status")
+async def get_task_status(task_id: str):
+	"""Get status and output results of a specific task."""
+	if task_id not in tasks_db:
+		raise HTTPException(status_code=404, detail="Task ID not found")
+	return TaskStatusResponse(**tasks_db[task_id])
 
 
 @app.get("/", response_class=HTMLResponse, summary="Embedded Web Dashboard")
