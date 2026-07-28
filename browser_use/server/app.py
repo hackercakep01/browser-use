@@ -263,7 +263,8 @@ class TaskStatusResponse(BaseModel):
 
 
 class FetchModelsRequest(BaseModel):
-	api_base_url: str = Field(..., description="API base URL (e.g. https://terbaik-9router.3obhmi.easypanel.host/v1).")
+	provider: str = Field(default="9router", description="LLM provider: '9router', 'openai', 'google', 'anthropic', or 'custom'.")
+	api_base_url: Optional[str] = Field(default=None, description="API base URL (for 9router / custom endpoints).")
 	api_key: Optional[str] = Field(default=None, description="Optional API key for authentication.")
 
 
@@ -566,38 +567,62 @@ async def update_settings_endpoint(req: SettingsUpdateRequest):
 		existing_keys = settings.get("api_keys", {})
 		existing_keys.update(req.api_keys)
 		settings["api_keys"] = existing_keys
-
 	save_settings(settings)
 	return {"message": "Settings saved successfully."}
 
 
-@app.post("/api/v1/models", dependencies=[Depends(require_auth)], response_model=FetchModelsResponse, summary="Import models from 9router")
+@app.post("/api/v1/models", dependencies=[Depends(require_auth)], response_model=FetchModelsResponse, summary="Import models from provider")
 async def fetch_models(request: FetchModelsRequest):
-	base_url = (request.api_base_url or "").strip().rstrip("/")
-	if not base_url:
-		settings = load_settings()
-		base_url = (settings.get("api_base_url") or "https://terbaik-9router.3obhmi.easypanel.host/v1").rstrip("/")
-
-	if not base_url.endswith("/models"):
-		url = f"{base_url}/models"
-	else:
-		url = base_url
+	provider = (request.provider or "9router").strip().lower()
+	settings = load_settings()
+	saved_keys = settings.get("api_keys", {})
 
 	api_key = (request.api_key or "").strip()
-	if not api_key:
-		settings = load_settings()
-		saved_keys = settings.get("api_keys", {})
-		api_key = (
-			saved_keys.get("9router")
-			or saved_keys.get("custom")
-			or saved_keys.get("openai")
-			or os.environ.get("OPENAI_API_KEY")
-			or ""
-		).strip()
 
+	url = ""
 	headers = {}
-	if api_key:
-		headers["Authorization"] = f"Bearer {api_key}"
+
+	if provider == "openai":
+		if not api_key:
+			api_key = (saved_keys.get("openai") or os.environ.get("OPENAI_API_KEY") or "").strip()
+		url = "https://api.openai.com/v1/models"
+		if api_key:
+			headers["Authorization"] = f"Bearer {api_key}"
+
+	elif provider == "google":
+		if not api_key:
+			api_key = (saved_keys.get("google") or os.environ.get("GOOGLE_API_KEY") or "").strip()
+		url = f"https://generativelanguage.googleapis.com/v1beta/models?key={api_key}" if api_key else "https://generativelanguage.googleapis.com/v1beta/models"
+
+	elif provider == "anthropic":
+		if not api_key:
+			api_key = (saved_keys.get("anthropic") or os.environ.get("ANTHROPIC_API_KEY") or "").strip()
+		url = "https://api.anthropic.com/v1/models"
+		headers = {"anthropic-version": "2023-06-01"}
+		if api_key:
+			headers["x-api-key"] = api_key
+
+	else:  # 9router or custom
+		if not api_key:
+			api_key = (
+				saved_keys.get("9router")
+				or saved_keys.get("custom")
+				or saved_keys.get("openai")
+				or os.environ.get("OPENAI_API_KEY")
+				or ""
+			).strip()
+
+		base_url = (request.api_base_url or "").strip().rstrip("/")
+		if not base_url:
+			base_url = (settings.get("api_base_url") or "https://terbaik-9router.3obhmi.easypanel.host/v1").rstrip("/")
+
+		if not base_url.endswith("/models"):
+			url = f"{base_url}/models"
+		else:
+			url = base_url
+
+		if api_key:
+			headers["Authorization"] = f"Bearer {api_key}"
 
 	try:
 		async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
@@ -605,34 +630,53 @@ async def fetch_models(request: FetchModelsRequest):
 			if resp.status_code != 200:
 				raise HTTPException(
 					status_code=resp.status_code,
-					detail=f"Failed to fetch models from {url} (HTTP {resp.status_code}): {resp.text[:300]}",
+					detail=f"Failed to fetch models from {provider} ({url}) [HTTP {resp.status_code}]: {resp.text[:300]}",
 				)
 
 			data = resp.json()
 			models_list: List[str] = []
 
-			if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
-				for item in data["data"]:
-					if isinstance(item, dict) and "id" in item:
-						models_list.append(str(item["id"]))
-					elif isinstance(item, str):
-						models_list.append(item)
-			elif isinstance(data, list):
-				for item in data:
-					if isinstance(item, dict) and "id" in item:
-						models_list.append(str(item["id"]))
-					elif isinstance(item, str):
-						models_list.append(item)
+			if provider == "google":
+				if isinstance(data, dict) and "models" in data and isinstance(data["models"], list):
+					for item in data["models"]:
+						if isinstance(item, dict) and "name" in item:
+							name_val = str(item["name"])
+							if name_val.startswith("models/"):
+								name_val = name_val[7:]
+							if "gemini" in name_val:
+								models_list.append(name_val)
+				if not models_list:
+					models_list = ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash"]
+			elif provider == "anthropic":
+				if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+					for item in data["data"]:
+						if isinstance(item, dict) and "id" in item:
+							models_list.append(str(item["id"]))
+				if not models_list:
+					models_list = ["claude-sonnet-4-0", "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022"]
+			else:
+				if isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+					for item in data["data"]:
+						if isinstance(item, dict) and "id" in item:
+							models_list.append(str(item["id"]))
+						elif isinstance(item, str):
+							models_list.append(item)
+				elif isinstance(data, list):
+					for item in data:
+						if isinstance(item, dict) and "id" in item:
+							models_list.append(str(item["id"]))
+						elif isinstance(item, str):
+							models_list.append(item)
 
 			if not models_list:
 				models_list = ["default"]
 
-			return FetchModelsResponse(api_base_url=request.api_base_url, models=models_list)
+			return FetchModelsResponse(api_base_url=request.api_base_url or url, models=models_list)
 	except HTTPException:
 		raise
 	except Exception as exc:
 		logger.exception(f"Error fetching models from {url}")
-		raise HTTPException(status_code=500, detail=f"Could not connect to {url}: {str(exc)}")
+		raise HTTPException(status_code=500, detail=f"Could not connect to {provider} ({url}): {str(exc)}")
 
 
 @app.post("/api/v1/run", dependencies=[Depends(require_auth)], response_model=TaskResponse, summary="Submit a Task to Queue or Execute Immediately")
@@ -887,18 +931,21 @@ async def dashboard():
 
                             <div id="apiBaseUrlContainer" class="mb-3">
                                 <label class="form-label text-secondary">API Base URL (e.g. 9router)</label>
-                                <div class="input-group">
-                                    <input type="text" id="apiBaseUrlInput" class="form-control" value="https://terbaik-9router.3obhmi.easypanel.host/v1" onchange="saveCurrentDefaults()">
-                                    <button type="button" class="btn btn-outline-info" onclick="importModels()">📥 Import Models</button>
-                                </div>
-                                <small id="importStatus" class="form-text text-muted"></small>
+                                <input type="text" id="apiBaseUrlInput" class="form-control" value="https://terbaik-9router.3obhmi.easypanel.host/v1" onchange="saveCurrentDefaults()">
                             </div>
 
                             <div class="mb-3">
-                                <label class="form-label text-secondary">Model Name</label>
-                                <select id="modelSelect" class="form-select" onchange="saveCurrentDefaults()">
-                                    <option value="gpt-4o">gpt-4o</option>
-                                </select>
+                                <label class="form-label text-secondary d-flex justify-content-between align-items-center mb-1">
+                                    <span>Model Name</span>
+                                    <button type="button" class="btn btn-link btn-sm p-0 text-decoration-none text-info fw-semibold" onclick="importModels()">📥 Import Models</button>
+                                </label>
+                                <div class="input-group">
+                                    <select id="modelSelect" class="form-select" onchange="saveCurrentDefaults()">
+                                        <option value="gpt-4o">gpt-4o</option>
+                                    </select>
+                                    <button type="button" class="btn btn-outline-info" onclick="importModels()">📥 Import</button>
+                                </div>
+                                <small id="importStatus" class="form-text text-muted mt-1 d-block"></small>
                             </div>
 
                             <div class="mb-3">
@@ -1319,17 +1366,23 @@ async def dashboard():
         }
 
         async function importModels() {
+            const provider = document.getElementById('providerSelect').value;
             const apiBaseUrl = document.getElementById('apiBaseUrlInput').value.trim();
             const apiKey = document.getElementById('apiKeyInput').value.trim();
             const importStatus = document.getElementById('importStatus');
             const modelSelect = document.getElementById('modelSelect');
 
-            if (!apiBaseUrl) {
-                importStatus.innerHTML = '<span class="text-danger">Please enter an API Base URL.</span>';
+            if (provider === 'browser_use') {
+                importStatus.innerHTML = '<span class="text-info">ChatBrowserUse is the dedicated model for Browser Use.</span>';
                 return;
             }
 
-            importStatus.innerHTML = '<span class="text-info">⏳ Fetching models from ' + apiBaseUrl + '...</span>';
+            if ((provider === '9router' || provider === 'custom') && !apiBaseUrl) {
+                importStatus.innerHTML = '<span class="text-danger">Please enter an API Base URL for 9router.</span>';
+                return;
+            }
+
+            importStatus.innerHTML = '<span class="text-info">⏳ Fetching models for ' + provider.toUpperCase() + '...</span>';
 
             try {
                 const res = await fetch('/api/v1/models', {
@@ -1339,7 +1392,8 @@ async def dashboard():
                         'Authorization': 'Bearer ' + sessionToken
                     },
                     body: JSON.stringify({
-                        api_base_url: apiBaseUrl,
+                        provider: provider,
+                        api_base_url: (provider === '9router' || provider === 'custom') ? apiBaseUrl : null,
                         api_key: apiKey || null
                     })
                 });
@@ -1360,7 +1414,7 @@ async def dashboard():
                     });
                     modelSelect.selectedIndex = 0;
                     saveCurrentDefaults();
-                    importStatus.innerHTML = `<span class="text-success">✅ Successfully imported ${data.models.length} model(s) & saved default!</span>`;
+                    importStatus.innerHTML = `<span class="text-success">✅ Successfully imported ${data.models.length} model(s) for ${provider.toUpperCase()} & saved default!</span>`;
                 } else {
                     importStatus.innerHTML = '<span class="text-warning">No models found in response.</span>';
                 }
