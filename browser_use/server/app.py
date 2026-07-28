@@ -2,7 +2,8 @@
 
 Provides a REST API, health check endpoints, 9router / custom OpenAI API compatibility,
 admin password setup & 30-day persistent session authentication, saved API credentials management,
-permanent task log disk persistence, date range log filtering, JSON export,
+permanent task log disk persistence, job queue engine (draft, running, complete, cancelled),
+STOP button for active jobs, auto-runner for draft queue jobs, date range log filtering, JSON export,
 and an interactive web dashboard for executing browser automation tasks.
 Designed for deployment on cloud platforms and Docker containers like Easypanel.
 """
@@ -59,6 +60,9 @@ os.makedirs(CONFIG_DIR, exist_ok=True)
 SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
 SESSIONS_FILE = os.path.join(CONFIG_DIR, "sessions.json")
 
+# Task handles map for running tasks to allow STOP cancellation
+active_task_handles: Dict[str, asyncio.Task] = {}
+
 
 # Password Hashing & Verification
 def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
@@ -87,6 +91,7 @@ def load_settings() -> dict:
 		"api_base_url": "https://terbaik-9router.3obhmi.easypanel.host/v1",
 		"default_provider": "9router",
 		"default_model": "gpt-4o",
+		"auto_run_drafts": True,
 		"api_keys": {
 			"9router": "",
 			"browser_use": "",
@@ -132,7 +137,6 @@ def create_session() -> str:
 
 def is_valid_session(token: Optional[str]) -> bool:
 	settings = load_settings()
-	# If no password has been setup yet, allow access to setup
 	if not settings.get("password_hash"):
 		return True
 	if not token:
@@ -236,6 +240,7 @@ class TaskRequest(BaseModel):
 		default=False,
 		description="Use Browser Use Cloud remote browser for stealth, high performance, and captcha bypass.",
 	)
+	as_draft: bool = Field(default=False, description="Save task as draft in queue without launching immediately.")
 
 
 class TaskResponse(BaseModel):
@@ -247,7 +252,7 @@ class TaskResponse(BaseModel):
 
 class TaskStatusResponse(BaseModel):
 	task_id: str
-	status: str
+	status: str  # "draft", "running", "complete", "cancelled", "failed"
 	task: str
 	created_at: str
 	completed_at: Optional[str] = None
@@ -271,6 +276,7 @@ class SettingsUpdateRequest(BaseModel):
 	api_base_url: Optional[str] = None
 	default_provider: Optional[str] = None
 	default_model: Optional[str] = None
+	auto_run_drafts: Optional[bool] = None
 	api_keys: Optional[Dict[str, str]] = None
 
 
@@ -302,6 +308,43 @@ def filter_tasks_list(
 	return filtered
 
 
+def process_next_draft_job() -> None:
+	"""Check for draft jobs in queue and process the next one if auto_run_drafts is enabled."""
+	settings = load_settings()
+	if not settings.get("auto_run_drafts", True):
+		return
+
+	# Check if any task is currently running
+	running_tasks = [t for t in tasks_db.values() if t.get("status") == "running"]
+	if running_tasks:
+		return
+
+	# Find oldest draft job
+	draft_jobs = [t for t in tasks_db.values() if t.get("status") == "draft"]
+	if not draft_jobs:
+		return
+
+	draft_jobs.sort(key=lambda x: x.get("created_at", ""))
+	next_job = draft_jobs[0]
+	task_id = next_job["task_id"]
+
+	req_dict = next_job.get("request", {})
+	if not req_dict:
+		req_dict = {
+			"task": next_job.get("task", ""),
+			"llm_provider": next_job.get("llm_provider", "9router"),
+			"model_name": next_job.get("model_name"),
+			"api_key": next_job.get("api_key"),
+			"api_base_url": next_job.get("api_base_url"),
+			"use_cloud": next_job.get("use_cloud", False),
+			"headless": True,
+		}
+
+	task_req = TaskRequest(**req_dict)
+	task_handle = asyncio.create_task(execute_task_background(task_id, task_req))
+	active_task_handles[task_id] = task_handle
+
+
 async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 	tasks_db[task_id]["status"] = "running"
 	save_task_to_disk(tasks_db[task_id])
@@ -309,17 +352,14 @@ async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 	settings = load_settings()
 	saved_keys = settings.get("api_keys", {})
 
-	# Resolve API Key
 	api_key = request.api_key
 	if not api_key:
 		api_key = saved_keys.get(request.llm_provider) or saved_keys.get("9router") or os.environ.get("OPENAI_API_KEY")
 
-	# Resolve API Base URL
 	api_base_url = request.api_base_url
 	if not api_base_url and request.llm_provider in ("9router", "custom"):
 		api_base_url = settings.get("api_base_url") or "https://terbaik-9router.3obhmi.easypanel.host/v1"
 
-	# Set into environment
 	if api_key:
 		if request.llm_provider == "browser_use":
 			os.environ["BROWSER_USE_API_KEY"] = api_key
@@ -331,6 +371,9 @@ async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 			os.environ["ANTHROPIC_API_KEY"] = api_key
 
 	try:
+		if tasks_db[task_id].get("status") == "cancelled":
+			return
+
 		from browser_use import Agent, Browser
 		from browser_use.llm import ChatAnthropic, ChatBrowserUse, ChatGoogle, ChatOpenAI
 
@@ -373,7 +416,10 @@ async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 
 		history = await agent.run(max_steps=request.max_steps)
 
-		tasks_db[task_id]["status"] = "completed"
+		if tasks_db[task_id].get("status") == "cancelled":
+			return
+
+		tasks_db[task_id]["status"] = "complete"
 		tasks_db[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
 		tasks_db[task_id]["result"] = history.final_result() or "Task finished successfully."
 		tasks_db[task_id]["urls_visited"] = history.urls()
@@ -381,6 +427,12 @@ async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 		tasks_db[task_id]["errors"] = [e for e in history.errors() if e]
 		save_task_to_disk(tasks_db[task_id])
 
+	except asyncio.CancelledError:
+		logger.info(f"Task {task_id} was stopped/cancelled by user.")
+		tasks_db[task_id]["status"] = "cancelled"
+		tasks_db[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+		tasks_db[task_id]["result"] = "Task stopped by user."
+		save_task_to_disk(tasks_db[task_id])
 	except Exception as exc:
 		logger.exception(f"Error executing task {task_id}")
 		tasks_db[task_id]["status"] = "failed"
@@ -388,6 +440,11 @@ async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 		tasks_db[task_id]["result"] = f"Error: {str(exc)}"
 		tasks_db[task_id]["errors"] = [str(exc)]
 		save_task_to_disk(tasks_db[task_id])
+	finally:
+		if task_id in active_task_handles:
+			del active_task_handles[task_id]
+		# Process next draft job in queue
+		process_next_draft_job()
 
 
 @app.get("/health", summary="Easypanel Healthcheck Endpoint")
@@ -472,11 +529,11 @@ async def auth_logout(response: Response, token: Optional[str] = Depends(get_tok
 @app.get("/api/v1/settings", dependencies=[Depends(require_auth)], summary="Get Saved Settings & Credentials")
 async def get_settings_endpoint():
 	settings = load_settings()
-	# Strip hash & salt
 	return {
 		"api_base_url": settings.get("api_base_url", "https://terbaik-9router.3obhmi.easypanel.host/v1"),
 		"default_provider": settings.get("default_provider", "9router"),
 		"default_model": settings.get("default_model", "gpt-4o"),
+		"auto_run_drafts": settings.get("auto_run_drafts", True),
 		"api_keys": settings.get("api_keys", {}),
 	}
 
@@ -490,6 +547,8 @@ async def update_settings_endpoint(req: SettingsUpdateRequest):
 		settings["default_provider"] = req.default_provider
 	if req.default_model is not None:
 		settings["default_model"] = req.default_model
+	if req.auto_run_drafts is not None:
+		settings["auto_run_drafts"] = req.auto_run_drafts
 	if req.api_keys is not None:
 		existing_keys = settings.get("api_keys", {})
 		existing_keys.update(req.api_keys)
@@ -547,30 +606,44 @@ async def fetch_models(request: FetchModelsRequest):
 		raise HTTPException(status_code=500, detail=f"Could not connect to {url}: {str(exc)}")
 
 
-@app.post("/api/v1/run", dependencies=[Depends(require_auth)], response_model=TaskResponse, summary="Execute a Browser-Use Automation Task")
-async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
+@app.post("/api/v1/run", dependencies=[Depends(require_auth)], response_model=TaskResponse, summary="Submit a Task to Queue or Execute Immediately")
+async def run_task(request: TaskRequest):
 	task_id = str(uuid.uuid4())
 	created_at = datetime.now(timezone.utc).isoformat()
+
+	if request.as_draft:
+		task_status = "draft"
+		msg = "Task saved as draft in queue."
+	else:
+		task_status = "pending"
+		msg = "Task queued for execution."
 
 	tasks_db[task_id] = {
 		"task_id": task_id,
 		"task": request.task,
-		"status": "pending",
+		"status": task_status,
 		"created_at": created_at,
 		"completed_at": None,
 		"result": None,
 		"errors": [],
 		"urls_visited": [],
 		"steps_completed": 0,
+		"request": request.model_dump(),
 	}
 
 	save_task_to_disk(tasks_db[task_id])
-	background_tasks.add_task(execute_task_background, task_id, request)
+
+	if not request.as_draft:
+		# Check if no task is running, launch immediately
+		running_tasks = [t for t in tasks_db.values() if t.get("status") == "running"]
+		if not running_tasks:
+			task_handle = asyncio.create_task(execute_task_background(task_id, request))
+			active_task_handles[task_id] = task_handle
 
 	return TaskResponse(
 		task_id=task_id,
-		status="pending",
-		message="Task queued and executing in background.",
+		status=task_status,
+		message=msg,
 		created_at=created_at,
 	)
 
@@ -604,6 +677,53 @@ async def export_tasks_json(
 	)
 
 
+@app.post("/api/v1/tasks/{task_id}/stop", dependencies=[Depends(require_auth)], summary="Stop/Cancel a Running Task")
+async def stop_task(task_id: str):
+	"""Stop/Cancel a running task immediately."""
+	if task_id not in tasks_db:
+		raise HTTPException(status_code=404, detail="Task ID not found")
+
+	tasks_db[task_id]["status"] = "cancelled"
+	tasks_db[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+	tasks_db[task_id]["result"] = "Task stopped by user."
+	save_task_to_disk(tasks_db[task_id])
+
+	if task_id in active_task_handles:
+		active_task_handles[task_id].cancel()
+		del active_task_handles[task_id]
+
+	# Auto run next draft
+	process_next_draft_job()
+
+	return {"message": f"Task {task_id} has been stopped.", "status": "cancelled"}
+
+
+@app.post("/api/v1/tasks/{task_id}/run", dependencies=[Depends(require_auth)], summary="Launch a Specific Draft Task")
+async def launch_draft_task(task_id: str):
+	"""Launch execution of a specific draft task."""
+	if task_id not in tasks_db:
+		raise HTTPException(status_code=404, detail="Task ID not found")
+
+	task_data = tasks_db[task_id]
+	req_dict = task_data.get("request", {})
+	if not req_dict:
+		req_dict = {
+			"task": task_data.get("task", ""),
+			"llm_provider": task_data.get("llm_provider", "9router"),
+			"model_name": task_data.get("model_name"),
+			"api_key": task_data.get("api_key"),
+			"api_base_url": task_data.get("api_base_url"),
+			"use_cloud": task_data.get("use_cloud", False),
+			"headless": True,
+		}
+
+	task_req = TaskRequest(**req_dict)
+	task_handle = asyncio.create_task(execute_task_background(task_id, task_req))
+	active_task_handles[task_id] = task_handle
+
+	return {"message": f"Task {task_id} started.", "status": "running"}
+
+
 @app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(require_auth)], response_model=TaskStatusResponse, summary="Get Task Status")
 async def get_task_status(task_id: str):
 	if task_id not in tasks_db:
@@ -613,7 +733,7 @@ async def get_task_status(task_id: str):
 
 @app.get("/", response_class=HTMLResponse, summary="Embedded Web Dashboard")
 async def dashboard():
-	"""Embedded interactive web dashboard for Browser-Use with admin login, 30-day session, 9router credentials & permanent logs."""
+	"""Embedded interactive web dashboard for Browser-Use with Job Queue, STOP button, Auto-Runner, Admin Login & Persistent Logs."""
 	html_content = """
 <!DOCTYPE html>
 <html lang="en">
@@ -630,11 +750,12 @@ async def dashboard():
         .form-control:focus, .form-select:focus { background-color: #0f172a; color: #f8fafc; border-color: #3b82f6; box-shadow: none; }
         .btn-primary { background-color: #3b82f6; border: none; font-weight: 600; }
         .btn-primary:hover { background-color: #2563eb; }
-        .btn-success { font-weight: 600; }
-        .badge-pending { background-color: #f59e0b; }
+        .btn-danger { font-weight: 600; }
+        .badge-draft { background-color: #eab308; color: #000; }
         .badge-running { background-color: #3b82f6; }
-        .badge-completed { background-color: #10b981; }
-        .badge-failed { background-color: #ef4444; }
+        .badge-complete { background-color: #10b981; }
+        .badge-cancelled { background-color: #ef4444; }
+        .badge-failed { background-color: #dc2626; }
         pre { background-color: #0f172a; border: 1px solid #334155; padding: 1rem; border-radius: 8px; color: #38bdf8; max-height: 400px; overflow-y: auto; }
         .table-dark { --bs-table-bg: #0f172a; --bs-table-border-color: #334155; }
         .result-truncate { max-width: 280px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
@@ -665,7 +786,7 @@ async def dashboard():
             <div class="d-flex align-items-center justify-content-between mb-4">
                 <div>
                     <h1 class="fw-bold mb-0">🌐 Browser-Use Dashboard</h1>
-                    <p class="text-secondary mb-0">Autonomous AI Web Automation Agent with 9router & Persistent Storage</p>
+                    <p class="text-secondary mb-0">Job Queue System (`draft`, `running`, `complete`, `cancelled`) with 9router Support</p>
                 </div>
                 <div class="d-flex align-items-center gap-2">
                     <button class="btn btn-outline-info btn-sm" onclick="openSettingsModal()">⚙️ Settings & API Keys</button>
@@ -673,7 +794,7 @@ async def dashboard():
                 </div>
             </div>
 
-            <!-- Task Creator & Live Execution Monitor -->
+            <!-- Task Creator & Live Active Task Monitor -->
             <div class="row g-4 mb-4">
                 <div class="col-lg-5">
                     <div class="card p-4">
@@ -721,7 +842,10 @@ async def dashboard():
                                 <label class="form-check-label text-secondary" for="useCloudCheck">Use Browser Use Cloud (use_cloud=True)</label>
                             </div>
 
-                            <button type="submit" class="btn btn-primary w-100 py-2">🚀 Launch Task</button>
+                            <div class="d-flex gap-2">
+                                <button type="button" class="btn btn-primary flex-grow-1 py-2" onclick="submitTask(false)">🚀 Launch Task Now</button>
+                                <button type="button" class="btn btn-warning py-2 fw-semibold" onclick="submitTask(true)">📋 Save to Draft</button>
+                            </div>
                         </form>
                     </div>
                 </div>
@@ -729,10 +853,13 @@ async def dashboard():
                 <div class="col-lg-7">
                     <div class="card p-4">
                         <div class="d-flex justify-content-between align-items-center mb-3">
-                            <h5 class="fw-bold mb-0">Live Active Task Monitor</h5>
-                            <button class="btn btn-sm btn-outline-secondary" onclick="checkStatus()">Refresh</button>
+                            <h5 class="fw-bold mb-0">Live Active Job Monitor</h5>
+                            <div class="d-flex align-items-center gap-2">
+                                <button id="stopActiveBtn" class="btn btn-danger btn-sm" style="display: none;" onclick="stopCurrentTask()">🛑 STOP Task</button>
+                                <button class="btn btn-sm btn-outline-secondary" onclick="checkStatus()">Refresh</button>
+                            </div>
                         </div>
-                        <div id="statusContainer" class="text-secondary">No active task running. Submit a prompt or view historical logs below.</div>
+                        <div id="statusContainer" class="text-secondary">No active task running. Launch a task or save to draft.</div>
                         <div id="outputContainer" style="display: none;" class="mt-3">
                             <h6>Result Output:</h6>
                             <pre id="resultText"></pre>
@@ -746,8 +873,14 @@ async def dashboard():
                 <div class="col-12">
                     <div class="card p-4">
                         <div class="d-flex flex-wrap align-items-center justify-content-between mb-3 gap-2">
-                            <h5 class="fw-bold mb-0">📜 Permanent Execution Logs & History</h5>
-                            <button class="btn btn-success btn-sm" onclick="downloadJsonLogs()">📥 Download JSON</button>
+                            <h5 class="fw-bold mb-0">📜 Job Queue & Persistent Logs</h5>
+                            <div class="d-flex align-items-center gap-3">
+                                <div class="form-check form-switch mb-0">
+                                    <input class="form-check-input" type="checkbox" id="autoRunDraftsCheck" onchange="toggleAutoRunDrafts(this.checked)">
+                                    <label class="form-check-label text-light small fw-semibold" for="autoRunDraftsCheck">⚡ Auto-run next Draft job</label>
+                                </div>
+                                <button class="btn btn-success btn-sm" onclick="downloadJsonLogs()">📥 Download JSON</button>
+                            </div>
                         </div>
 
                         <div class="row g-2 align-items-end mb-4 bg-dark p-3 rounded border border-secondary">
@@ -763,10 +896,11 @@ async def dashboard():
                                 <label class="form-label text-secondary mb-1">Status</label>
                                 <select id="filterStatus" class="form-select form-select-sm">
                                     <option value="all" selected>All Statuses</option>
-                                    <option value="completed">Completed</option>
-                                    <option value="failed">Failed</option>
+                                    <option value="draft">Draft (Queued)</option>
                                     <option value="running">Running</option>
-                                    <option value="pending">Pending</option>
+                                    <option value="complete">Complete</option>
+                                    <option value="cancelled">Cancelled (Stopped)</option>
+                                    <option value="failed">Failed</option>
                                 </select>
                             </div>
                             <div class="col-md-3 d-flex gap-2">
@@ -784,12 +918,12 @@ async def dashboard():
                                         <th>Status</th>
                                         <th>Steps</th>
                                         <th>Result / Details</th>
-                                        <th>Action</th>
+                                        <th>Actions</th>
                                     </tr>
                                 </thead>
                                 <tbody id="logsTableBody">
                                     <tr>
-                                        <td colspan="6" class="text-center text-secondary py-4">Loading persistent logs...</td>
+                                        <td colspan="6" class="text-center text-secondary py-4">Loading job queue & logs...</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -972,12 +1106,27 @@ async def dashboard():
                     document.getElementById('settingApiBaseUrl').value = data.api_base_url;
                 }
 
+                document.getElementById('autoRunDraftsCheck').checked = data.auto_run_drafts !== false;
+
                 const keys = data.api_keys || {};
                 document.getElementById('key9router').value = keys['9router'] || '';
                 document.getElementById('keyBrowserUse').value = keys['browser_use'] || '';
                 document.getElementById('keyOpenAI').value = keys['openai'] || '';
                 document.getElementById('keyGoogle').value = keys['google'] || '';
                 document.getElementById('keyAnthropic').value = keys['anthropic'] || '';
+            } catch (e) {}
+        }
+
+        async function toggleAutoRunDrafts(enabled) {
+            try {
+                await fetch('/api/v1/settings', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + sessionToken
+                    },
+                    body: JSON.stringify({ auto_run_drafts: enabled })
+                });
             } catch (e) {}
         }
 
@@ -1103,9 +1252,13 @@ async def dashboard():
             }
         }
 
-        document.getElementById('taskForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
-            const task = document.getElementById('taskInput').value;
+        async function submitTask(asDraft) {
+            const task = document.getElementById('taskInput').value.trim();
+            if (!task) {
+                alert('Please enter a task prompt.');
+                return;
+            }
+
             const provider = document.getElementById('providerSelect').value;
             const apiBaseUrl = document.getElementById('apiBaseUrlInput').value.trim();
             const modelName = document.getElementById('modelSelect').value;
@@ -1128,17 +1281,25 @@ async def dashboard():
                         api_base_url: (provider === '9router' || provider === 'custom') ? apiBaseUrl : null,
                         api_key: apiKey || null,
                         use_cloud: useCloud,
-                        headless: true
+                        headless: true,
+                        as_draft: asDraft
                     })
                 });
+
                 const data = await res.json();
                 currentTaskId = data.task_id;
-                startPolling();
+                
+                if (asDraft) {
+                    document.getElementById('statusContainer').innerHTML = `<span class="text-warning">📋 Task saved to Draft queue (ID: ${data.task_id})</span>`;
+                } else {
+                    startPolling();
+                }
+
                 loadLogsTable();
             } catch (err) {
                 document.getElementById('statusContainer').innerHTML = '<span class="text-danger">Failed to submit task: ' + err.message + '</span>';
             }
-        });
+        }
 
         function startPolling() {
             if (pollInterval) clearInterval(pollInterval);
@@ -1154,19 +1315,27 @@ async def dashboard():
                 });
                 const data = await res.json();
                 
-                let badgeClass = 'badge-pending';
+                let badgeClass = 'badge-draft';
                 if (data.status === 'running') badgeClass = 'badge-running';
-                if (data.status === 'completed') badgeClass = 'badge-completed';
+                if (data.status === 'complete') badgeClass = 'badge-complete';
+                if (data.status === 'cancelled') badgeClass = 'badge-cancelled';
                 if (data.status === 'failed') badgeClass = 'badge-failed';
+
+                const stopBtn = document.getElementById('stopActiveBtn');
+                if (data.status === 'running') {
+                    stopBtn.style.display = 'inline-block';
+                } else {
+                    stopBtn.style.display = 'none';
+                }
 
                 document.getElementById('statusContainer').innerHTML = `
                     <div><strong>Task ID:</strong> <code>${data.task_id}</code></div>
                     <div><strong>Status:</strong> <span class="badge ${badgeClass}">${data.status.toUpperCase()}</span></div>
-                    <div><strong>Steps Completed:</strong> ${data.steps_completed}</div>
+                    <div><strong>Steps Completed:</strong> ${data.steps_completed || 0}</div>
                     ${data.urls_visited && data.urls_visited.length ? '<div><strong>Visited URLs:</strong> ' + data.urls_visited.join(', ') + '</div>' : ''}
                 `;
 
-                if (data.status === 'completed' || data.status === 'failed') {
+                if (data.status === 'complete' || data.status === 'cancelled' || data.status === 'failed') {
                     clearInterval(pollInterval);
                     document.getElementById('outputContainer').style.display = 'block';
                     document.getElementById('resultText').textContent = data.result || 'No output.';
@@ -1174,6 +1343,49 @@ async def dashboard():
                 }
             } catch (err) {
                 console.error(err);
+            }
+        }
+
+        async function stopCurrentTask() {
+            if (!currentTaskId) return;
+            try {
+                await fetch(`/api/v1/tasks/${currentTaskId}/stop`, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
+                checkStatus();
+                loadLogsTable();
+            } catch (err) {
+                alert('Failed to stop task: ' + err.message);
+            }
+        }
+
+        async function runDraftTask(taskId) {
+            try {
+                await fetch(`/api/v1/tasks/${taskId}/run`, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
+                currentTaskId = taskId;
+                startPolling();
+                loadLogsTable();
+            } catch (err) {
+                alert('Failed to start draft task: ' + err.message);
+            }
+        }
+
+        async function stopTask(taskId) {
+            try {
+                await fetch(`/api/v1/tasks/${taskId}/stop`, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
+                if (currentTaskId === taskId) {
+                    checkStatus();
+                }
+                loadLogsTable();
+            } catch (err) {
+                alert('Failed to stop task: ' + err.message);
             }
         }
 
@@ -1207,18 +1419,27 @@ async def dashboard():
             tbody.innerHTML = '';
 
             if (!logs || logs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-4">No matching task logs found.</td></tr>';
+                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-4">No matching job queue logs found.</td></tr>';
                 return;
             }
 
             logs.forEach(log => {
-                let badgeClass = 'badge-pending';
+                let badgeClass = 'badge-draft';
                 if (log.status === 'running') badgeClass = 'badge-running';
-                if (log.status === 'completed') badgeClass = 'badge-completed';
+                if (log.status === 'complete') badgeClass = 'badge-complete';
+                if (log.status === 'cancelled') badgeClass = 'badge-cancelled';
                 if (log.status === 'failed') badgeClass = 'badge-failed';
 
                 const formattedDate = log.created_at ? log.created_at.replace('T', ' ').substring(0, 19) : '-';
-                const resultSnippet = log.result ? log.result.substring(0, 80) + (log.result.length > 80 ? '...' : '') : (log.status === 'running' ? 'Executing...' : '-');
+                const resultSnippet = log.result ? log.result.substring(0, 80) + (log.result.length > 80 ? '...' : '') : (log.status === 'running' ? 'Executing in browser...' : (log.status === 'draft' ? 'Queued in Draft' : '-'));
+
+                let actionButtons = `<button class="btn btn-sm btn-outline-info me-1" onclick="viewLogDetail('${log.task_id}')">View</button>`;
+                
+                if (log.status === 'running') {
+                    actionButtons += `<button class="btn btn-sm btn-danger me-1" onclick="stopTask('${log.task_id}')">🛑 STOP</button>`;
+                } else if (log.status === 'draft') {
+                    actionButtons += `<button class="btn btn-sm btn-primary me-1" onclick="runDraftTask('${log.task_id}')">▶️ Run Now</button>`;
+                }
 
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
@@ -1227,7 +1448,7 @@ async def dashboard():
                     <td><span class="badge ${badgeClass}">${(log.status || 'unknown').toUpperCase()}</span></td>
                     <td>${log.steps_completed || 0}</td>
                     <td><span class="result-truncate text-secondary" title="${log.result || ''}">${resultSnippet}</span></td>
-                    <td><button class="btn btn-sm btn-outline-info" onclick="viewLogDetail('${log.task_id}')">View</button></td>
+                    <td>${actionButtons}</td>
                 `;
                 tbody.appendChild(tr);
             });

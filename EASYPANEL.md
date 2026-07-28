@@ -61,6 +61,22 @@ Panduan ini mejelaskan cara men-deploy **Browser-Use** pada server Anda mengguna
 
 ---
 
+## 📋 Job Queue System & Tombol STOP
+
+Browser-Use memiliki sistem manajemen antrean tugas (Job Queue System) lengkap:
+
+- **Status Lifecycle**:
+  - `draft`: Task disimpan di antrean draft.
+  - `running`: Task sedang mengeksekusi perintah di browser.
+  - `complete`: Task telah selesai secara sukses.
+  - `cancelled`: Task dihentikan oleh pengguna via tombol STOP.
+- **Tombol 🛑 STOP Task**:
+  Ketika ada task berstatus `RUNNING`, Anda dapat menghentikannya secara langsung kapan saja dengan mengklik tombol **🛑 STOP Task** (atau `POST /api/v1/tasks/{task_id}/stop`).
+- **Auto-Run Next Draft Job**:
+  Dengan mengaktifkan toggle **⚡ Auto-run next Draft job**, saat job yang sedang berjalan selesai (`complete` atau `cancelled`), sistem secara otomatis akan mengambil job `draft` berikutnya dan langsung meng-eksekusinya.
+
+---
+
 ## ⚙️ Penyimpanan API Key & Endpoint Credentials (9router)
 
 Anda dapat menyimpan API Base URL (9router) dan API Key (9router, Browser Use Cloud, OpenAI, Gemini, Claude) secara permanen di server:
@@ -105,6 +121,8 @@ Setelah status service berubah menjadi **Healthy**:
 - **Web UI Dashboard**: Buka `http://<your-easypanel-domain-or-ip>:8000/` di browser untuk mengakses Dashboard Browser-Use interaktif.
 - **Import Models API Endpoint**: `POST /api/v1/models`
 - **Run Task API Endpoint**: `POST /api/v1/run`
+- **Stop Task API Endpoint**: `POST /api/v1/tasks/{task_id}/stop`
+- **Run Draft Task API Endpoint**: `POST /api/v1/tasks/{task_id}/run`
 - **Task Log Search API Endpoint**: `GET /api/v1/tasks`
 - **JSON Log Export API Endpoint**: `GET /api/v1/tasks/export`
 
