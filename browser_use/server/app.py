@@ -753,6 +753,46 @@ async def launch_draft_task(task_id: str):
 	return {"message": f"Task {task_id} started.", "status": "running"}
 
 
+@app.post("/api/v1/tasks/{task_id}/redraft", dependencies=[Depends(require_auth)], summary="Create a New Draft Task Copy")
+async def redraft_task(task_id: str):
+	"""Create a new draft task copy from an existing historical task log."""
+	if task_id not in tasks_db:
+		raise HTTPException(status_code=404, detail="Task ID not found")
+
+	original_task = tasks_db[task_id]
+	new_task_id = str(uuid.uuid4())
+	created_at = datetime.now(timezone.utc).isoformat()
+
+	new_task = {
+		"task_id": new_task_id,
+		"task": original_task.get("task", ""),
+		"status": "draft",
+		"created_at": created_at,
+		"completed_at": None,
+		"result": None,
+		"errors": [],
+		"urls_visited": [],
+		"steps_completed": 0,
+		"request": original_task.get("request", {
+			"task": original_task.get("task", ""),
+			"llm_provider": original_task.get("llm_provider", "9router"),
+			"model_name": original_task.get("model_name"),
+			"api_key": original_task.get("api_key"),
+			"api_base_url": original_task.get("api_base_url"),
+			"use_cloud": original_task.get("use_cloud", False),
+			"headless": True,
+		}),
+	}
+
+	tasks_db[new_task_id] = new_task
+	save_task_to_disk(new_task)
+
+	# Auto run queue check if enabled and no running tasks
+	process_next_draft_job()
+
+	return {"message": "Redrafted task created successfully.", "task_id": new_task_id, "status": "draft"}
+
+
 @app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(require_auth)], response_model=TaskStatusResponse, summary="Get Task Status")
 async def get_task_status(task_id: str):
 	if task_id not in tasks_db:
@@ -1462,7 +1502,10 @@ async def dashboard():
                 const formattedDate = log.created_at ? log.created_at.replace('T', ' ').substring(0, 19) : '-';
                 const resultSnippet = log.result ? log.result.substring(0, 80) + (log.result.length > 80 ? '...' : '') : (log.status === 'running' ? 'Executing in browser...' : (log.status === 'draft' ? 'Queued in Draft' : '-'));
 
-                let actionButtons = `<button class="btn btn-sm btn-outline-info me-1" onclick="viewLogDetail('${log.task_id}')">View</button>`;
+                let actionButtons = `
+                    <button class="btn btn-sm btn-outline-info me-1" onclick="viewLogDetail('${log.task_id}')">View</button>
+                    <button class="btn btn-sm btn-outline-warning me-1" onclick="redraftTask('${log.task_id}')">🔄 Redraft</button>
+                `;
                 
                 if (log.status === 'running') {
                     actionButtons += `<button class="btn btn-sm btn-danger me-1" onclick="stopTask('${log.task_id}')">🛑 STOP</button>`;
@@ -1481,6 +1524,20 @@ async def dashboard():
                 `;
                 tbody.appendChild(tr);
             });
+        }
+
+        async function redraftTask(taskId) {
+            try {
+                const res = await fetch(`/api/v1/tasks/${taskId}/redraft`, {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Failed to redraft task');
+                loadLogsTable();
+            } catch (err) {
+                alert('Failed to create redraft: ' + err.message);
+            }
         }
 
         function viewLogDetail(taskId) {
