@@ -876,7 +876,7 @@ async def dashboard():
                             
                             <div class="mb-3">
                                 <label class="form-label text-secondary">LLM Model Provider</label>
-                                <select id="providerSelect" class="form-select" onchange="toggleProviderFields()">
+                                <select id="providerSelect" class="form-select" onchange="onProviderChange()">
                                     <option value="9router" selected>9router / Custom OpenAI Compatible Endpoint</option>
                                     <option value="browser_use">ChatBrowserUse (Fast & Accurate)</option>
                                     <option value="openai">OpenAI (Official)</option>
@@ -888,7 +888,7 @@ async def dashboard():
                             <div id="apiBaseUrlContainer" class="mb-3">
                                 <label class="form-label text-secondary">API Base URL (e.g. 9router)</label>
                                 <div class="input-group">
-                                    <input type="text" id="apiBaseUrlInput" class="form-control" value="https://terbaik-9router.3obhmi.easypanel.host/v1">
+                                    <input type="text" id="apiBaseUrlInput" class="form-control" value="https://terbaik-9router.3obhmi.easypanel.host/v1" onchange="saveCurrentDefaults()">
                                     <button type="button" class="btn btn-outline-info" onclick="importModels()">📥 Import Models</button>
                                 </div>
                                 <small id="importStatus" class="form-text text-muted"></small>
@@ -896,7 +896,7 @@ async def dashboard():
 
                             <div class="mb-3">
                                 <label class="form-label text-secondary">Model Name</label>
-                                <select id="modelSelect" class="form-select">
+                                <select id="modelSelect" class="form-select" onchange="saveCurrentDefaults()">
                                     <option value="gpt-4o">gpt-4o</option>
                                 </select>
                             </div>
@@ -1162,6 +1162,34 @@ async def dashboard():
             checkAuthStatus();
         }
 
+        async function saveCurrentDefaults() {
+            const provider = document.getElementById('providerSelect').value;
+            const apiBaseUrl = document.getElementById('apiBaseUrlInput').value.trim();
+            const modelName = document.getElementById('modelSelect').value;
+
+            if (!provider) return;
+
+            try {
+                await fetch('/api/v1/settings', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + sessionToken
+                    },
+                    body: JSON.stringify({
+                        default_provider: provider,
+                        api_base_url: apiBaseUrl,
+                        default_model: modelName
+                    })
+                });
+            } catch (e) {}
+        }
+
+        function onProviderChange() {
+            toggleProviderFields();
+            saveCurrentDefaults();
+        }
+
         async function loadSavedSettings() {
             try {
                 const res = await fetch('/api/v1/settings', {
@@ -1170,9 +1198,27 @@ async def dashboard():
                 if (!res.ok) return;
                 const data = await res.json();
 
+                if (data.default_provider) {
+                    document.getElementById('providerSelect').value = data.default_provider;
+                }
+
                 if (data.api_base_url) {
                     document.getElementById('apiBaseUrlInput').value = data.api_base_url;
                     document.getElementById('settingApiBaseUrl').value = data.api_base_url;
+                }
+
+                toggleProviderFields();
+
+                if (data.default_model) {
+                    const modelSelect = document.getElementById('modelSelect');
+                    let found = Array.from(modelSelect.options).some(opt => opt.value === data.default_model);
+                    if (!found) {
+                        const opt = document.createElement('option');
+                        opt.value = data.default_model;
+                        opt.textContent = data.default_model;
+                        modelSelect.appendChild(opt);
+                    }
+                    modelSelect.value = data.default_model;
                 }
 
                 document.getElementById('autoRunDraftsCheck').checked = data.auto_run_drafts !== false;
@@ -1312,7 +1358,9 @@ async def dashboard():
                         opt.textContent = m;
                         modelSelect.appendChild(opt);
                     });
-                    importStatus.innerHTML = `<span class="text-success">✅ Successfully imported ${data.models.length} model(s) from 9router!</span>`;
+                    modelSelect.selectedIndex = 0;
+                    saveCurrentDefaults();
+                    importStatus.innerHTML = `<span class="text-success">✅ Successfully imported ${data.models.length} model(s) & saved default!</span>`;
                 } else {
                     importStatus.innerHTML = '<span class="text-warning">No models found in response.</span>';
                 }
