@@ -1,6 +1,7 @@
 """FastAPI Web Server for Browser-Use.
 
 Provides a REST API, health check endpoints, 9router / custom OpenAI API compatibility,
+admin password setup & 30-day persistent session authentication, saved API credentials management,
 permanent task log disk persistence, date range log filtering, JSON export,
 and an interactive web dashboard for executing browser automation tasks.
 Designed for deployment on cloud platforms and Docker containers like Easypanel.
@@ -9,18 +10,20 @@ Designed for deployment on cloud platforms and Docker containers like Easypanel.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import secrets
 import sys
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
-from fastapi import BackgroundTasks, FastAPI, HTTPException, status
+from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -39,7 +42,7 @@ app.add_middleware(
 	allow_headers=["*"],
 )
 
-# Setup Data Directory & Persistent Logs Directory
+# Setup Data Directory & Configuration Persistence Paths
 DATA_DIR = os.environ.get("DATA_DIR", "/data")
 if not os.path.exists(DATA_DIR):
 	try:
@@ -49,11 +52,124 @@ if not os.path.exists(DATA_DIR):
 		os.makedirs(DATA_DIR, exist_ok=True)
 
 LOGS_DIR = os.path.join(DATA_DIR, "logs")
+CONFIG_DIR = os.path.join(DATA_DIR, "config")
 os.makedirs(LOGS_DIR, exist_ok=True)
+os.makedirs(CONFIG_DIR, exist_ok=True)
+
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "settings.json")
+SESSIONS_FILE = os.path.join(CONFIG_DIR, "sessions.json")
 
 
+# Password Hashing & Verification
+def hash_password(password: str, salt: Optional[str] = None) -> tuple[str, str]:
+	if not salt:
+		salt = secrets.token_hex(16)
+	key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000)
+	return key.hex(), salt
+
+
+def verify_password(password: str, stored_hash: str, salt: str) -> bool:
+	key = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100000)
+	return secrets.compare_digest(key.hex(), stored_hash)
+
+
+# Settings Persistence
+def load_settings() -> dict:
+	if os.path.exists(SETTINGS_FILE):
+		try:
+			with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+				return json.load(f)
+		except Exception:
+			pass
+	return {
+		"password_hash": None,
+		"password_salt": None,
+		"api_base_url": "https://terbaik-9router.3obhmi.easypanel.host/v1",
+		"default_provider": "9router",
+		"default_model": "gpt-4o",
+		"api_keys": {
+			"9router": "",
+			"browser_use": "",
+			"openai": "",
+			"google": "",
+			"anthropic": "",
+		},
+	}
+
+
+def save_settings(data: dict) -> None:
+	with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+		json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+# Sessions Management (30-day persistent login)
+def load_sessions() -> dict:
+	if os.path.exists(SESSIONS_FILE):
+		try:
+			with open(SESSIONS_FILE, "r", encoding="utf-8") as f:
+				return json.load(f)
+		except Exception:
+			pass
+	return {}
+
+
+def save_sessions(sessions: dict) -> None:
+	with open(SESSIONS_FILE, "w", encoding="utf-8") as f:
+		json.dump(sessions, f, ensure_ascii=False, indent=2)
+
+
+def create_session() -> str:
+	token = secrets.token_hex(32)
+	sessions = load_sessions()
+	expires_at = datetime.now(timezone.utc).timestamp() + (30 * 86400)  # 30 days
+	sessions[token] = {
+		"created_at": datetime.now(timezone.utc).isoformat(),
+		"expires_at": expires_at,
+	}
+	save_sessions(sessions)
+	return token
+
+
+def is_valid_session(token: Optional[str]) -> bool:
+	settings = load_settings()
+	# If no password has been setup yet, allow access to setup
+	if not settings.get("password_hash"):
+		return True
+	if not token:
+		return False
+	sessions = load_sessions()
+	if token in sessions:
+		exp = sessions[token].get("expires_at", 0)
+		if datetime.now(timezone.utc).timestamp() < exp:
+			return True
+		else:
+			del sessions[token]
+			save_sessions(sessions)
+	return False
+
+
+def get_token_from_request(
+	request: Request,
+	browser_use_session: Optional[str] = Cookie(None),
+	authorization: Optional[str] = Header(None),
+	x_session_token: Optional[str] = Header(None),
+) -> Optional[str]:
+	if browser_use_session:
+		return browser_use_session
+	if x_session_token:
+		return x_session_token
+	if authorization and authorization.startswith("Bearer "):
+		return authorization[7:]
+	return None
+
+
+def require_auth(request: Request, token: Optional[str] = Depends(get_token_from_request)) -> None:
+	if not is_valid_session(token):
+		raise HTTPException(status_code=401, detail="Unauthorized. Authentication required.")
+
+
+# Permanent Task Persistence
 def save_task_to_disk(task_data: dict) -> None:
-	"""Persist task log entry permanently to disk as JSON."""
 	try:
 		task_id = task_data.get("task_id")
 		if not task_id:
@@ -66,7 +182,6 @@ def save_task_to_disk(task_data: dict) -> None:
 
 
 def load_all_tasks_from_disk() -> Dict[str, Dict[str, Any]]:
-	"""Load all task logs from disk on startup."""
 	tasks: Dict[str, Dict[str, Any]] = {}
 	if not os.path.exists(LOGS_DIR):
 		return tasks
@@ -83,17 +198,24 @@ def load_all_tasks_from_disk() -> Dict[str, Dict[str, Any]]:
 	return tasks
 
 
-# Initialize tasks database permanently from disk
+# Initialize tasks database
 tasks_db: Dict[str, Dict[str, Any]] = load_all_tasks_from_disk()
 
 
-class TaskRequest(BaseModel):
-	"""Request schema for initiating a browser automation task."""
+# Pydantic Schemas
+class SetupPasswordRequest(BaseModel):
+	password: str = Field(..., min_length=4, description="New admin password.")
 
+
+class LoginRequest(BaseModel):
+	password: str = Field(..., description="Admin password.")
+
+
+class TaskRequest(BaseModel):
 	task: str = Field(..., description="The task description for the AI agent to execute.")
 	llm_provider: str = Field(
-		default="browser_use",
-		description="LLM provider: 'browser_use' (recommended), '9router', 'custom', 'openai', 'google', or 'anthropic'.",
+		default="9router",
+		description="LLM provider: '9router', 'browser_use', 'custom', 'openai', 'google', or 'anthropic'.",
 	)
 	model_name: Optional[str] = Field(
 		default=None,
@@ -101,7 +223,7 @@ class TaskRequest(BaseModel):
 	)
 	api_key: Optional[str] = Field(
 		default=None,
-		description="API key for the chosen LLM provider if not configured via environment variables.",
+		description="API key for the chosen LLM provider if not configured in settings.",
 	)
 	api_base_url: Optional[str] = Field(
 		default=None,
@@ -117,8 +239,6 @@ class TaskRequest(BaseModel):
 
 
 class TaskResponse(BaseModel):
-	"""Response schema after initiating a task."""
-
 	task_id: str
 	status: str
 	message: str
@@ -126,10 +246,8 @@ class TaskResponse(BaseModel):
 
 
 class TaskStatusResponse(BaseModel):
-	"""Status schema for querying task execution progress."""
-
 	task_id: str
-	status: str  # "pending", "running", "completed", "failed"
+	status: str
 	task: str
 	created_at: str
 	completed_at: Optional[str] = None
@@ -140,17 +258,20 @@ class TaskStatusResponse(BaseModel):
 
 
 class FetchModelsRequest(BaseModel):
-	"""Request schema for importing/fetching models from a custom OpenAI-compatible API gateway (e.g. 9router)."""
-
 	api_base_url: str = Field(..., description="API base URL (e.g. https://terbaik-9router.3obhmi.easypanel.host/v1).")
 	api_key: Optional[str] = Field(default=None, description="Optional API key for authentication.")
 
 
 class FetchModelsResponse(BaseModel):
-	"""Response schema containing list of imported models."""
-
 	api_base_url: str
 	models: List[str]
+
+
+class SettingsUpdateRequest(BaseModel):
+	api_base_url: Optional[str] = None
+	default_provider: Optional[str] = None
+	default_model: Optional[str] = None
+	api_keys: Optional[Dict[str, str]] = None
 
 
 def filter_tasks_list(
@@ -159,18 +280,15 @@ def filter_tasks_list(
 	end_date: Optional[str] = None,
 	status_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-	"""Filter task logs by date range (start_date, end_date) and status."""
 	filtered = []
 	for t in tasks:
-		# Status filter
 		if status_filter and status_filter.strip() and status_filter.lower() != "all":
 			if t.get("status", "").lower() != status_filter.strip().lower():
 				continue
 
-		# Date filter (compare YYYY-MM-DD strings)
 		created_at = t.get("created_at", "")
 		if created_at:
-			task_date = created_at[:10]  # YYYY-MM-DD
+			task_date = created_at[:10]
 			if start_date and start_date.strip():
 				if task_date < start_date.strip()[:10]:
 					continue
@@ -180,59 +298,66 @@ def filter_tasks_list(
 
 		filtered.append(t)
 
-	# Sort newest first
 	filtered.sort(key=lambda x: x.get("created_at", ""), reverse=True)
 	return filtered
 
 
 async def execute_task_background(task_id: str, request: TaskRequest) -> None:
-	"""Background worker function executing the Browser-Use Agent."""
 	tasks_db[task_id]["status"] = "running"
 	save_task_to_disk(tasks_db[task_id])
 
-	# Set API key into environment if provided
-	if request.api_key:
+	settings = load_settings()
+	saved_keys = settings.get("api_keys", {})
+
+	# Resolve API Key
+	api_key = request.api_key
+	if not api_key:
+		api_key = saved_keys.get(request.llm_provider) or saved_keys.get("9router") or os.environ.get("OPENAI_API_KEY")
+
+	# Resolve API Base URL
+	api_base_url = request.api_base_url
+	if not api_base_url and request.llm_provider in ("9router", "custom"):
+		api_base_url = settings.get("api_base_url") or "https://terbaik-9router.3obhmi.easypanel.host/v1"
+
+	# Set into environment
+	if api_key:
 		if request.llm_provider == "browser_use":
-			os.environ["BROWSER_USE_API_KEY"] = request.api_key
+			os.environ["BROWSER_USE_API_KEY"] = api_key
 		elif request.llm_provider in ("openai", "9router", "custom"):
-			os.environ["OPENAI_API_KEY"] = request.api_key
+			os.environ["OPENAI_API_KEY"] = api_key
 		elif request.llm_provider == "google":
-			os.environ["GOOGLE_API_KEY"] = request.api_key
+			os.environ["GOOGLE_API_KEY"] = api_key
 		elif request.llm_provider == "anthropic":
-			os.environ["ANTHROPIC_API_KEY"] = request.api_key
+			os.environ["ANTHROPIC_API_KEY"] = api_key
 
 	try:
-		# Import browser-use modules inside task runner
 		from browser_use import Agent, Browser
 		from browser_use.llm import ChatAnthropic, ChatBrowserUse, ChatGoogle, ChatOpenAI
 
-		# Select LLM
 		llm = None
 		provider = request.llm_provider.lower()
 
-		if provider in ("9router", "custom", "openai_compatible") or request.api_base_url:
-			model = request.model_name or "gpt-4o"
+		if provider in ("9router", "custom", "openai_compatible") or api_base_url:
+			model = request.model_name or settings.get("default_model") or "gpt-4o"
 			llm = ChatOpenAI(
 				model=model,
-				base_url=request.api_base_url,
-				api_key=request.api_key or os.environ.get("OPENAI_API_KEY"),
+				base_url=api_base_url,
+				api_key=api_key or os.environ.get("OPENAI_API_KEY"),
 			)
 		elif provider == "browser_use":
 			llm = ChatBrowserUse()
 		elif provider == "openai":
 			model = request.model_name or "gpt-4.1-mini"
-			llm = ChatOpenAI(model=model, api_key=request.api_key)
+			llm = ChatOpenAI(model=model, api_key=api_key)
 		elif provider == "google":
 			model = request.model_name or "gemini-2.5-flash"
-			llm = ChatGoogle(model=model, api_key=request.api_key)
+			llm = ChatGoogle(model=model, api_key=api_key)
 		elif provider == "anthropic":
 			model = request.model_name or "claude-sonnet-4-0"
-			llm = ChatAnthropic(model=model, api_key=request.api_key)
+			llm = ChatAnthropic(model=model, api_key=api_key)
 		else:
-			# Default fallback to ChatBrowserUse
 			llm = ChatBrowserUse()
 
-		# Setup browser options
 		browser = None
 		if request.use_cloud:
 			browser = Browser(use_cloud=True, headless=request.headless)
@@ -267,7 +392,6 @@ async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 
 @app.get("/health", summary="Easypanel Healthcheck Endpoint")
 async def health_check():
-	"""Healthcheck endpoint used by Easypanel and load balancers."""
 	return {
 		"status": "ok",
 		"service": "browser-use",
@@ -276,9 +400,107 @@ async def health_check():
 	}
 
 
-@app.post("/api/v1/models", response_model=FetchModelsResponse, summary="Import models from 9router / custom OpenAI API base URL")
+# Authentication API Endpoints
+@app.get("/api/v1/auth/status", summary="Check Authentication Status")
+async def auth_status(token: Optional[str] = Depends(get_token_from_request)):
+	settings = load_settings()
+	has_password = bool(settings.get("password_hash"))
+	authenticated = is_valid_session(token)
+	return {
+		"setup_required": not has_password,
+		"authenticated": authenticated,
+	}
+
+
+@app.post("/api/v1/auth/setup", summary="Initial Password Setup")
+async def auth_setup(req: SetupPasswordRequest, response: Response):
+	settings = load_settings()
+	if settings.get("password_hash"):
+		raise HTTPException(status_code=400, detail="Password has already been setup.")
+
+	hash_val, salt = hash_password(req.password)
+	settings["password_hash"] = hash_val
+	settings["password_salt"] = salt
+	save_settings(settings)
+
+	token = create_session()
+	response.set_cookie(
+		key="browser_use_session",
+		value=token,
+		max_age=30 * 86400,
+		httponly=True,
+		samesite="lax",
+	)
+	return {"message": "Admin password setup successfully.", "token": token}
+
+
+@app.post("/api/v1/auth/login", summary="Admin Login")
+async def auth_login(req: LoginRequest, response: Response):
+	settings = load_settings()
+	stored_hash = settings.get("password_hash")
+	salt = settings.get("password_salt")
+
+	if not stored_hash or not salt:
+		raise HTTPException(status_code=400, detail="Setup required. Please set up password first.")
+
+	if not verify_password(req.password, stored_hash, salt):
+		raise HTTPException(status_code=401, detail="Invalid password.")
+
+	token = create_session()
+	response.set_cookie(
+		key="browser_use_session",
+		value=token,
+		max_age=30 * 86400,
+		httponly=True,
+		samesite="lax",
+	)
+	return {"message": "Logged in successfully.", "token": token}
+
+
+@app.post("/api/v1/auth/logout", summary="Logout Admin")
+async def auth_logout(response: Response, token: Optional[str] = Depends(get_token_from_request)):
+	if token:
+		sessions = load_sessions()
+		if token in sessions:
+			del sessions[token]
+			save_sessions(sessions)
+	response.delete_cookie(key="browser_use_session")
+	return {"message": "Logged out successfully."}
+
+
+# Saved Credentials API Endpoints
+@app.get("/api/v1/settings", dependencies=[Depends(require_auth)], summary="Get Saved Settings & Credentials")
+async def get_settings_endpoint():
+	settings = load_settings()
+	# Strip hash & salt
+	return {
+		"api_base_url": settings.get("api_base_url", "https://terbaik-9router.3obhmi.easypanel.host/v1"),
+		"default_provider": settings.get("default_provider", "9router"),
+		"default_model": settings.get("default_model", "gpt-4o"),
+		"api_keys": settings.get("api_keys", {}),
+	}
+
+
+@app.post("/api/v1/settings", dependencies=[Depends(require_auth)], summary="Save Settings & Credentials")
+async def update_settings_endpoint(req: SettingsUpdateRequest):
+	settings = load_settings()
+	if req.api_base_url is not None:
+		settings["api_base_url"] = req.api_base_url
+	if req.default_provider is not None:
+		settings["default_provider"] = req.default_provider
+	if req.default_model is not None:
+		settings["default_model"] = req.default_model
+	if req.api_keys is not None:
+		existing_keys = settings.get("api_keys", {})
+		existing_keys.update(req.api_keys)
+		settings["api_keys"] = existing_keys
+
+	save_settings(settings)
+	return {"message": "Settings saved successfully."}
+
+
+@app.post("/api/v1/models", dependencies=[Depends(require_auth)], response_model=FetchModelsResponse, summary="Import models from 9router")
 async def fetch_models(request: FetchModelsRequest):
-	"""Fetch available AI model list from a custom OpenAI-compatible API base URL (e.g. 9router)."""
 	base_url = request.api_base_url.rstrip("/")
 	if not base_url.endswith("/models"):
 		url = f"{base_url}/models"
@@ -325,9 +547,8 @@ async def fetch_models(request: FetchModelsRequest):
 		raise HTTPException(status_code=500, detail=f"Could not connect to {url}: {str(exc)}")
 
 
-@app.post("/api/v1/run", response_model=TaskResponse, summary="Execute a Browser-Use Automation Task")
+@app.post("/api/v1/run", dependencies=[Depends(require_auth)], response_model=TaskResponse, summary="Execute a Browser-Use Automation Task")
 async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
-	"""Endpoint to submit and launch a browser automation task."""
 	task_id = str(uuid.uuid4())
 	created_at = datetime.now(timezone.utc).isoformat()
 
@@ -354,24 +575,22 @@ async def run_task(request: TaskRequest, background_tasks: BackgroundTasks):
 	)
 
 
-@app.get("/api/v1/tasks", summary="List All Tasks with Optional Date Range & Status Filtering")
+@app.get("/api/v1/tasks", dependencies=[Depends(require_auth)], summary="List All Tasks with Optional Date Range Filtering")
 async def list_tasks(
 	start_date: Optional[str] = None,
 	end_date: Optional[str] = None,
 	status: Optional[str] = None,
 ):
-	"""List task logs with support for date range filtering (start_date, end_date) and status filtering."""
 	all_tasks = list(tasks_db.values())
 	return filter_tasks_list(all_tasks, start_date=start_date, end_date=end_date, status_filter=status)
 
 
-@app.get("/api/v1/tasks/export", summary="Export Filtered Task Logs as JSON File")
+@app.get("/api/v1/tasks/export", dependencies=[Depends(require_auth)], summary="Export Filtered Task Logs as JSON File")
 async def export_tasks_json(
 	start_date: Optional[str] = None,
 	end_date: Optional[str] = None,
 	status: Optional[str] = None,
 ):
-	"""Export task logs as a downloadable JSON file attachment."""
 	all_tasks = list(tasks_db.values())
 	filtered = filter_tasks_list(all_tasks, start_date=start_date, end_date=end_date, status_filter=status)
 
@@ -385,9 +604,8 @@ async def export_tasks_json(
 	)
 
 
-@app.get("/api/v1/tasks/{task_id}", response_model=TaskStatusResponse, summary="Get Task Status")
+@app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(require_auth)], response_model=TaskStatusResponse, summary="Get Task Status")
 async def get_task_status(task_id: str):
-	"""Get status and output results of a specific task."""
 	if task_id not in tasks_db:
 		raise HTTPException(status_code=404, detail="Task ID not found")
 	return TaskStatusResponse(**tasks_db[task_id])
@@ -395,7 +613,7 @@ async def get_task_status(task_id: str):
 
 @app.get("/", response_class=HTMLResponse, summary="Embedded Web Dashboard")
 async def dashboard():
-	"""Embedded interactive web dashboard for Browser-Use with permanent logs, date range search, and JSON export."""
+	"""Embedded interactive web dashboard for Browser-Use with admin login, 30-day session, 9router credentials & permanent logs."""
 	html_content = """
 <!DOCTYPE html>
 <html lang="en">
@@ -420,141 +638,210 @@ async def dashboard():
         pre { background-color: #0f172a; border: 1px solid #334155; padding: 1rem; border-radius: 8px; color: #38bdf8; max-height: 400px; overflow-y: auto; }
         .table-dark { --bs-table-bg: #0f172a; --bs-table-border-color: #334155; }
         .result-truncate { max-width: 280px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: block; }
+        .auth-container { max-width: 420px; margin: 5rem auto 0; }
     </style>
 </head>
 <body>
     <div class="container mb-5">
-        <div class="d-flex align-items-center justify-content-between mb-4">
-            <div>
-                <h1 class="fw-bold mb-0">🌐 Browser-Use Dashboard</h1>
-                <p class="text-secondary mb-0">Autonomous AI Web Automation Agent with Permanent Log History & 9router Support</p>
+        <!-- Auth Screen (Setup / Login) -->
+        <div id="authScreen" class="auth-container" style="display: none;">
+            <div class="card p-4 text-center">
+                <h3 class="fw-bold mb-2">🌐 Browser-Use</h3>
+                <p id="authTitle" class="text-secondary mb-4">Please log in to continue</p>
+                <div id="authError" class="alert alert-danger p-2 small mb-3" style="display: none;"></div>
+                
+                <form id="authForm">
+                    <div class="mb-3 text-start">
+                        <label id="passwordLabel" class="form-label text-secondary">Admin Password</label>
+                        <input type="password" id="authPassword" class="form-control" placeholder="Enter password..." required autocomplete="current-password">
+                    </div>
+                    <button type="submit" id="authSubmitBtn" class="btn btn-primary w-100 py-2">Log In</button>
+                </form>
             </div>
-            <span class="badge bg-success px-3 py-2">Health: OK</span>
         </div>
 
-        <!-- Task Creator & Live Execution View -->
-        <div class="row g-4 mb-4">
-            <div class="col-lg-5">
-                <div class="card p-4">
-                    <h5 class="fw-bold mb-3">Create Automation Task</h5>
-                    <form id="taskForm">
-                        <div class="mb-3">
-                            <label class="form-label text-secondary">Task Prompt</label>
-                            <textarea id="taskInput" class="form-control" rows="3" placeholder="e.g. Find the top post on Hacker News and extract the summary" required></textarea>
-                        </div>
-                        
-                        <div class="mb-3">
-                            <label class="form-label text-secondary">LLM Model Provider</label>
-                            <select id="providerSelect" class="form-select" onchange="toggleProviderFields()">
-                                <option value="browser_use">ChatBrowserUse (Recommended - Fast & Accurate)</option>
-                                <option value="9router" selected>9router / Custom OpenAI Compatible Endpoint</option>
-                                <option value="openai">OpenAI (Official)</option>
-                                <option value="google">Google Gemini</option>
-                                <option value="anthropic">Anthropic Claude</option>
-                            </select>
-                        </div>
+        <!-- Main Dashboard View -->
+        <div id="mainDashboard" style="display: none;">
+            <div class="d-flex align-items-center justify-content-between mb-4">
+                <div>
+                    <h1 class="fw-bold mb-0">🌐 Browser-Use Dashboard</h1>
+                    <p class="text-secondary mb-0">Autonomous AI Web Automation Agent with 9router & Persistent Storage</p>
+                </div>
+                <div class="d-flex align-items-center gap-2">
+                    <button class="btn btn-outline-info btn-sm" onclick="openSettingsModal()">⚙️ Settings & API Keys</button>
+                    <button class="btn btn-outline-danger btn-sm" onclick="logout()">Logout</button>
+                </div>
+            </div>
 
-                        <div id="apiBaseUrlContainer" class="mb-3">
-                            <label class="form-label text-secondary">API Base URL (e.g. 9router)</label>
-                            <div class="input-group">
-                                <input type="text" id="apiBaseUrlInput" class="form-control" value="https://terbaik-9router.3obhmi.easypanel.host/v1" placeholder="https://terbaik-9router.3obhmi.easypanel.host/v1">
-                                <button type="button" class="btn btn-outline-info" onclick="importModels()">📥 Import Models</button>
+            <!-- Task Creator & Live Execution Monitor -->
+            <div class="row g-4 mb-4">
+                <div class="col-lg-5">
+                    <div class="card p-4">
+                        <h5 class="fw-bold mb-3">Create Automation Task</h5>
+                        <form id="taskForm">
+                            <div class="mb-3">
+                                <label class="form-label text-secondary">Task Prompt</label>
+                                <textarea id="taskInput" class="form-control" rows="3" placeholder="e.g. Find the top post on Hacker News and extract the summary" required></textarea>
                             </div>
-                            <small id="importStatus" class="form-text text-muted"></small>
-                        </div>
+                            
+                            <div class="mb-3">
+                                <label class="form-label text-secondary">LLM Model Provider</label>
+                                <select id="providerSelect" class="form-select" onchange="toggleProviderFields()">
+                                    <option value="9router" selected>9router / Custom OpenAI Compatible Endpoint</option>
+                                    <option value="browser_use">ChatBrowserUse (Fast & Accurate)</option>
+                                    <option value="openai">OpenAI (Official)</option>
+                                    <option value="google">Google Gemini</option>
+                                    <option value="anthropic">Anthropic Claude</option>
+                                </select>
+                            </div>
 
-                        <div class="mb-3">
-                            <label class="form-label text-secondary">Model Name</label>
-                            <select id="modelSelect" class="form-select">
-                                <option value="gpt-4o">gpt-4o (Default)</option>
-                            </select>
-                        </div>
+                            <div id="apiBaseUrlContainer" class="mb-3">
+                                <label class="form-label text-secondary">API Base URL (e.g. 9router)</label>
+                                <div class="input-group">
+                                    <input type="text" id="apiBaseUrlInput" class="form-control" value="https://terbaik-9router.3obhmi.easypanel.host/v1">
+                                    <button type="button" class="btn btn-outline-info" onclick="importModels()">📥 Import Models</button>
+                                </div>
+                                <small id="importStatus" class="form-text text-muted"></small>
+                            </div>
 
-                        <div class="mb-3">
-                            <label class="form-label text-secondary">API Key (Optional if set in ENV)</label>
-                            <input type="password" id="apiKeyInput" class="form-control" placeholder="API Key...">
-                        </div>
+                            <div class="mb-3">
+                                <label class="form-label text-secondary">Model Name</label>
+                                <select id="modelSelect" class="form-select">
+                                    <option value="gpt-4o">gpt-4o</option>
+                                </select>
+                            </div>
 
-                        <div class="form-check form-switch mb-3">
-                            <input class="form-check-input" type="checkbox" id="useCloudCheck">
-                            <label class="form-check-label text-secondary" for="useCloudCheck">Use Browser Use Cloud (use_cloud=True)</label>
-                        </div>
+                            <div class="mb-3">
+                                <label class="form-label text-secondary">API Key (Optional - Saved in Settings)</label>
+                                <input type="password" id="apiKeyInput" class="form-control" placeholder="Leave empty to use saved key...">
+                            </div>
 
-                        <button type="submit" class="btn btn-primary w-100 py-2">🚀 Launch Task</button>
-                    </form>
+                            <div class="form-check form-switch mb-3">
+                                <input class="form-check-input" type="checkbox" id="useCloudCheck">
+                                <label class="form-check-label text-secondary" for="useCloudCheck">Use Browser Use Cloud (use_cloud=True)</label>
+                            </div>
+
+                            <button type="submit" class="btn btn-primary w-100 py-2">🚀 Launch Task</button>
+                        </form>
+                    </div>
+                </div>
+
+                <div class="col-lg-7">
+                    <div class="card p-4">
+                        <div class="d-flex justify-content-between align-items-center mb-3">
+                            <h5 class="fw-bold mb-0">Live Active Task Monitor</h5>
+                            <button class="btn btn-sm btn-outline-secondary" onclick="checkStatus()">Refresh</button>
+                        </div>
+                        <div id="statusContainer" class="text-secondary">No active task running. Submit a prompt or view historical logs below.</div>
+                        <div id="outputContainer" style="display: none;" class="mt-3">
+                            <h6>Result Output:</h6>
+                            <pre id="resultText"></pre>
+                        </div>
+                    </div>
                 </div>
             </div>
 
-            <div class="col-lg-7">
-                <div class="card p-4">
-                    <div class="d-flex justify-content-between align-items-center mb-3">
-                        <h5 class="fw-bold mb-0">Live Active Task Monitor</h5>
-                        <button class="btn btn-sm btn-outline-secondary" onclick="checkStatus()">Refresh</button>
-                    </div>
-                    <div id="statusContainer" class="text-secondary">No active task running. Submit a prompt or view historical logs below.</div>
-                    <div id="outputContainer" style="display: none;" class="mt-3">
-                        <h6>Result Output:</h6>
-                        <pre id="resultText"></pre>
+            <!-- Permanent Logs & Filter Section -->
+            <div class="row">
+                <div class="col-12">
+                    <div class="card p-4">
+                        <div class="d-flex flex-wrap align-items-center justify-content-between mb-3 gap-2">
+                            <h5 class="fw-bold mb-0">📜 Permanent Execution Logs & History</h5>
+                            <button class="btn btn-success btn-sm" onclick="downloadJsonLogs()">📥 Download JSON</button>
+                        </div>
+
+                        <div class="row g-2 align-items-end mb-4 bg-dark p-3 rounded border border-secondary">
+                            <div class="col-md-3">
+                                <label class="form-label text-secondary mb-1">Start Date</label>
+                                <input type="date" id="filterStartDate" class="form-control form-control-sm">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label text-secondary mb-1">End Date</label>
+                                <input type="date" id="filterEndDate" class="form-control form-control-sm">
+                            </div>
+                            <div class="col-md-3">
+                                <label class="form-label text-secondary mb-1">Status</label>
+                                <select id="filterStatus" class="form-select form-select-sm">
+                                    <option value="all" selected>All Statuses</option>
+                                    <option value="completed">Completed</option>
+                                    <option value="failed">Failed</option>
+                                    <option value="running">Running</option>
+                                    <option value="pending">Pending</option>
+                                </select>
+                            </div>
+                            <div class="col-md-3 d-flex gap-2">
+                                <button onclick="loadLogsTable()" class="btn btn-primary btn-sm flex-grow-1">🔍 Filter Logs</button>
+                                <button onclick="resetFilters()" class="btn btn-outline-secondary btn-sm">Reset</button>
+                            </div>
+                        </div>
+
+                        <div class="table-responsive">
+                            <table class="table table-dark table-hover align-middle mb-0">
+                                <thead>
+                                    <tr>
+                                        <th>Task ID</th>
+                                        <th>Date & Time</th>
+                                        <th>Status</th>
+                                        <th>Steps</th>
+                                        <th>Result / Details</th>
+                                        <th>Action</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="logsTableBody">
+                                    <tr>
+                                        <td colspan="6" class="text-center text-secondary py-4">Loading persistent logs...</td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
                 </div>
             </div>
         </div>
+    </div>
 
-        <!-- Permanent Logs & Filter Section -->
-        <div class="row">
-            <div class="col-12">
-                <div class="card p-4">
-                    <div class="d-flex flex-wrap align-items-center justify-content-between mb-3 gap-2">
-                        <h5 class="fw-bold mb-0">📜 Permanent Execution Logs & History</h5>
-                        <button class="btn btn-success btn-sm" onclick="downloadJsonLogs()">📥 Download JSON</button>
-                    </div>
+    <!-- Settings Modal -->
+    <div class="modal fade" id="settingsModal" tabindex="-1" aria-hidden="true">
+        <div class="modal-dialog modal-lg">
+            <div class="modal-content card">
+                <div class="modal-header border-secondary">
+                    <h5 class="modal-title fw-bold">⚙️ Saved API Settings & Credentials</h5>
+                    <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+                </div>
+                <div class="modal-body">
+                    <form id="settingsForm">
+                        <div class="mb-3">
+                            <label class="form-label text-secondary">Default 9router / Custom API Base URL</label>
+                            <input type="text" id="settingApiBaseUrl" class="form-control" placeholder="https://terbaik-9router.3obhmi.easypanel.host/v1">
+                        </div>
 
-                    <!-- Filter Controls -->
-                    <div class="row g-2 align-items-end mb-4 bg-dark p-3 rounded border border-secondary">
-                        <div class="col-md-3">
-                            <label class="form-label text-secondary mb-1">Start Date</label>
-                            <input type="date" id="filterStartDate" class="form-control form-control-sm">
+                        <h6 class="fw-bold mt-4 mb-3 text-info">Saved API Keys</h6>
+                        <div class="mb-3">
+                            <label class="form-label text-secondary">9router API Key</label>
+                            <input type="password" id="key9router" class="form-control" placeholder="9router API Key...">
                         </div>
-                        <div class="col-md-3">
-                            <label class="form-label text-secondary mb-1">End Date</label>
-                            <input type="date" id="filterEndDate" class="form-control form-control-sm">
+                        <div class="mb-3">
+                            <label class="form-label text-secondary">Browser Use Cloud API Key (`BROWSER_USE_API_KEY`)</label>
+                            <input type="password" id="keyBrowserUse" class="form-control" placeholder="bu_...">
                         </div>
-                        <div class="col-md-3">
-                            <label class="form-label text-secondary mb-1">Status</label>
-                            <select id="filterStatus" class="form-select form-select-sm">
-                                <option value="all" selected>All Statuses</option>
-                                <option value="completed">Completed</option>
-                                <option value="failed">Failed</option>
-                                <option value="running">Running</option>
-                                <option value="pending">Pending</option>
-                            </select>
+                        <div class="mb-3">
+                            <label class="form-label text-secondary">OpenAI API Key</label>
+                            <input type="password" id="keyOpenAI" class="form-control" placeholder="sk-proj-...">
                         </div>
-                        <div class="col-md-3 d-flex gap-2">
-                            <button onclick="loadLogsTable()" class="btn btn-primary btn-sm flex-grow-1">🔍 Filter Logs</button>
-                            <button onclick="resetFilters()" class="btn btn-outline-secondary btn-sm">Reset</button>
+                        <div class="mb-3">
+                            <label class="form-label text-secondary">Google Gemini API Key</label>
+                            <input type="password" id="keyGoogle" class="form-control" placeholder="AIzaSy...">
                         </div>
-                    </div>
+                        <div class="mb-3">
+                            <label class="form-label text-secondary">Anthropic Claude API Key</label>
+                            <input type="password" id="keyAnthropic" class="form-control" placeholder="sk-ant-...">
+                        </div>
 
-                    <!-- Logs Table -->
-                    <div class="table-responsive">
-                        <table class="table table-dark table-hover align-middle mb-0">
-                            <thead>
-                                <tr>
-                                    <th>Task ID</th>
-                                    <th>Date & Time</th>
-                                    <th>Status</th>
-                                    <th>Steps</th>
-                                    <th>Result / Details</th>
-                                    <th>Action</th>
-                                </tr>
-                            </thead>
-                            <tbody id="logsTableBody">
-                                <tr>
-                                    <td colspan="6" class="text-center text-secondary py-4">Loading persistent logs...</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
+                        <div id="settingsAlert" class="alert alert-success p-2 small mt-3" style="display: none;"></div>
+                        <div class="text-end mt-4">
+                            <button type="submit" class="btn btn-primary px-4">💾 Save Settings</button>
+                        </div>
+                    </form>
                 </div>
             </div>
         </div>
@@ -577,9 +864,170 @@ async def dashboard():
 
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
     <script>
+        let isSetupRequired = false;
         let currentTaskId = null;
         let pollInterval = null;
         let currentLogsData = [];
+        let sessionToken = localStorage.getItem('browser_use_token') || '';
+
+        async function checkAuthStatus() {
+            try {
+                const res = await fetch('/api/v1/auth/status', {
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
+                const data = await res.json();
+                
+                isSetupRequired = data.setup_required;
+
+                if (data.setup_required) {
+                    showAuthScreen(true);
+                } else if (!data.authenticated) {
+                    showAuthScreen(false);
+                } else {
+                    showMainDashboard();
+                }
+            } catch (err) {
+                console.error(err);
+            }
+        }
+
+        function showAuthScreen(setupMode) {
+            document.getElementById('mainDashboard').style.display = 'none';
+            document.getElementById('authScreen').style.display = 'block';
+            const authTitle = document.getElementById('authTitle');
+            const authSubmitBtn = document.getElementById('authSubmitBtn');
+
+            if (setupMode) {
+                authTitle.textContent = 'First Time Setup: Set Admin Password';
+                authSubmitBtn.textContent = 'Set Password & Login';
+            } else {
+                authTitle.textContent = 'Welcome back! Enter password to log in';
+                authSubmitBtn.textContent = 'Log In';
+            }
+        }
+
+        function showMainDashboard() {
+            document.getElementById('authScreen').style.display = 'none';
+            document.getElementById('mainDashboard').style.display = 'block';
+            loadSavedSettings();
+            toggleProviderFields();
+            loadLogsTable();
+        }
+
+        document.getElementById('authForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const password = document.getElementById('authPassword').value;
+            const authError = document.getElementById('authError');
+            authError.style.display = 'none';
+
+            const endpoint = isSetupRequired ? '/api/v1/auth/setup' : '/api/v1/auth/login';
+
+            try {
+                const res = await fetch(endpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ password })
+                });
+
+                const data = await res.json();
+
+                if (!res.ok) {
+                    throw new Error(data.detail || 'Authentication failed');
+                }
+
+                if (data.token) {
+                    sessionToken = data.token;
+                    localStorage.setItem('browser_use_token', data.token);
+                }
+
+                showMainDashboard();
+            } catch (err) {
+                authError.textContent = err.message;
+                authError.style.display = 'block';
+            }
+        });
+
+        async function logout() {
+            try {
+                await fetch('/api/v1/auth/logout', {
+                    method: 'POST',
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
+            } catch (e) {}
+            sessionToken = '';
+            localStorage.removeItem('browser_use_token');
+            checkAuthStatus();
+        }
+
+        async function loadSavedSettings() {
+            try {
+                const res = await fetch('/api/v1/settings', {
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
+                if (!res.ok) return;
+                const data = await res.json();
+
+                if (data.api_base_url) {
+                    document.getElementById('apiBaseUrlInput').value = data.api_base_url;
+                    document.getElementById('settingApiBaseUrl').value = data.api_base_url;
+                }
+
+                const keys = data.api_keys || {};
+                document.getElementById('key9router').value = keys['9router'] || '';
+                document.getElementById('keyBrowserUse').value = keys['browser_use'] || '';
+                document.getElementById('keyOpenAI').value = keys['openai'] || '';
+                document.getElementById('keyGoogle').value = keys['google'] || '';
+                document.getElementById('keyAnthropic').value = keys['anthropic'] || '';
+            } catch (e) {}
+        }
+
+        function openSettingsModal() {
+            loadSavedSettings();
+            const modal = new bootstrap.Modal(document.getElementById('settingsModal'));
+            modal.show();
+        }
+
+        document.getElementById('settingsForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            const apiBaseUrl = document.getElementById('settingApiBaseUrl').value.trim();
+            const alertBox = document.getElementById('settingsAlert');
+
+            const apiKeys = {
+                '9router': document.getElementById('key9router').value.trim(),
+                'browser_use': document.getElementById('keyBrowserUse').value.trim(),
+                'openai': document.getElementById('keyOpenAI').value.trim(),
+                'google': document.getElementById('keyGoogle').value.trim(),
+                'anthropic': document.getElementById('keyAnthropic').value.trim()
+            };
+
+            try {
+                const res = await fetch('/api/v1/settings', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + sessionToken
+                    },
+                    body: JSON.stringify({
+                        api_base_url: apiBaseUrl,
+                        api_keys: apiKeys
+                    })
+                });
+
+                if (!res.ok) throw new Error('Failed to save settings');
+
+                if (apiBaseUrl) {
+                    document.getElementById('apiBaseUrlInput').value = apiBaseUrl;
+                }
+
+                alertBox.textContent = '✅ Settings & API Keys saved successfully!';
+                alertBox.style.display = 'block';
+                setTimeout(() => { alertBox.style.display = 'none'; }, 3000);
+            } catch (err) {
+                alertBox.className = 'alert alert-danger p-2 small mt-3';
+                alertBox.textContent = err.message;
+                alertBox.style.display = 'block';
+            }
+        });
 
         function toggleProviderFields() {
             const provider = document.getElementById('providerSelect').value;
@@ -622,7 +1070,10 @@ async def dashboard():
             try {
                 const res = await fetch('/api/v1/models', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + sessionToken
+                    },
                     body: JSON.stringify({
                         api_base_url: apiBaseUrl,
                         api_key: apiKey || null
@@ -666,7 +1117,10 @@ async def dashboard():
             try {
                 const res = await fetch('/api/v1/run', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + sessionToken
+                    },
                     body: JSON.stringify({
                         task: task,
                         llm_provider: provider,
@@ -695,7 +1149,9 @@ async def dashboard():
         async function checkStatus() {
             if (!currentTaskId) return;
             try {
-                const res = await fetch('/api/v1/tasks/' + currentTaskId);
+                const res = await fetch('/api/v1/tasks/' + currentTaskId, {
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
                 const data = await res.json();
                 
                 let badgeClass = 'badge-pending';
@@ -735,7 +1191,9 @@ async def dashboard():
             url += params.toString();
 
             try {
-                const res = await fetch(url);
+                const res = await fetch(url, {
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
                 const data = await res.json();
                 currentLogsData = data;
                 renderLogsTable(data);
@@ -807,8 +1265,7 @@ async def dashboard():
         }
 
         // Initialize on page load
-        toggleProviderFields();
-        loadLogsTable();
+        checkAuthStatus();
     </script>
 </body>
 </html>

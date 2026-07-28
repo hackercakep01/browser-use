@@ -54,6 +54,25 @@ Panduan ini mejelaskan cara men-deploy **Browser-Use** pada server Anda mengguna
 
 ---
 
+## 🔒 Autentikasi Password & Sesi Permanent 30 Hari
+
+- **Setup Password Pertama Kali**: Saat pertama kali membuka Web Dashboard, Anda akan diminta membuat **Admin Password** untuk mengamankan instance Browser-Use Anda.
+- **Persistent Session 30 Hari**: Setelah login, sesi Anda disimpan di HTTP-only cookie & localStorage selama 30 hari. Anda dapat terus menggunakan dashboard tanpa perlu mengetik ulang password secara berulang.
+
+---
+
+## ⚙️ Penyimpanan API Key & Endpoint Credentials (9router)
+
+Anda dapat menyimpan API Base URL (9router) dan API Key (9router, Browser Use Cloud, OpenAI, Gemini, Claude) secara permanen di server:
+
+1. Buka Web UI Dashboard dan login.
+2. Klik tombol **⚙️ Settings & API Keys** di pojok kanan atas.
+3. Masukkan **Default 9router API Base URL** dan API Key milik Anda.
+4. Klik **Save Settings**.
+5. Setelah disimpan, tugas automation akan secara otomatis menggunakan API Key dan Endpoint yang tersimpan tanpa perlu diketik ulang setiap kali membuat task!
+
+---
+
 ## 🔀 Integrasi 9router / Custom OpenAI Endpoint
 
 Browser-Use telah dilengkapi dengan dukungan penuh untuk **9router** dan Custom OpenAI-compatible API Gateway:
@@ -63,17 +82,6 @@ Browser-Use telah dilengkapi dengan dukungan penuh untuk **9router** dan Custom 
 3. Masukkan **API Base URL** Anda (contoh: `https://terbaik-9router.3obhmi.easypanel.host/v1`).
 4. Klik tombol **📥 Import Models** untuk secara otomatis mengambil dan mengimpor daftar model AI yang tersedia dari 9router Anda.
 5. Pilih model yang diimpor dari dropdown dan jalankan tugas browser automation!
-
-### Contoh Payload REST API dengan 9router:
-```json
-{
-  "task": "Extract top posts summary from Hacker News",
-  "llm_provider": "9router",
-  "api_base_url": "https://terbaik-9router.3obhmi.easypanel.host/v1",
-  "model_name": "gpt-4o",
-  "api_key": "your_9router_api_key_optional"
-}
-```
 
 ---
 
