@@ -77,6 +77,19 @@ Browser-Use telah dilengkapi dengan dukungan penuh untuk **9router** dan Custom 
 
 ---
 
+## 📊 Logging Permanen, Filter Tanggal & Export JSON
+
+Seluruh log eksekusi disimpan secara permanen di direktori `/data/logs/` yang terhubung dengan persistent volume `browser-use-data`.
+
+- **Filter Tanggal & Status**:
+  Gunakan kontrol Start Date, End Date, dan Status pada Web UI atau kirim query parameter pada API:
+  `GET /api/v1/tasks?start_date=2026-07-01&end_date=2026-07-28&status=completed`
+- **Download JSON Log**:
+  Klik tombol **📥 Download JSON** pada Web UI atau akses endpoint API:
+  `GET /api/v1/tasks/export?start_date=2026-07-01&end_date=2026-07-28`
+
+---
+
 ## 🔍 Verification & Health Check
 
 Setelah status service berubah menjadi **Healthy**:
@@ -84,6 +97,8 @@ Setelah status service berubah menjadi **Healthy**:
 - **Web UI Dashboard**: Buka `http://<your-easypanel-domain-or-ip>:8000/` di browser untuk mengakses Dashboard Browser-Use interaktif.
 - **Import Models API Endpoint**: `POST /api/v1/models`
 - **Run Task API Endpoint**: `POST /api/v1/run`
+- **Task Log Search API Endpoint**: `GET /api/v1/tasks`
+- **JSON Log Export API Endpoint**: `GET /api/v1/tasks/export`
 
 ---
 
