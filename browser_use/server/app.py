@@ -352,23 +352,36 @@ async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 	settings = load_settings()
 	saved_keys = settings.get("api_keys", {})
 
-	api_key = request.api_key
+	# Resolve API Key cleanly
+	api_key = (request.api_key or "").strip()
 	if not api_key:
-		api_key = saved_keys.get(request.llm_provider) or saved_keys.get("9router") or os.environ.get("OPENAI_API_KEY")
+		api_key = (
+			saved_keys.get(request.llm_provider)
+			or saved_keys.get("9router")
+			or saved_keys.get("custom")
+			or saved_keys.get("openai")
+			or os.environ.get("OPENAI_API_KEY")
+			or ""
+		).strip()
 
-	api_base_url = request.api_base_url
-	if not api_base_url and request.llm_provider in ("9router", "custom"):
-		api_base_url = settings.get("api_base_url") or "https://terbaik-9router.3obhmi.easypanel.host/v1"
+	api_key_or_none = api_key if api_key else None
 
-	if api_key:
+	# Resolve API Base URL cleanly
+	api_base_url = (request.api_base_url or "").strip()
+	if not api_base_url and request.llm_provider in ("9router", "custom", "openai_compatible"):
+		api_base_url = (settings.get("api_base_url") or "https://terbaik-9router.3obhmi.easypanel.host/v1").strip()
+
+	api_base_url_or_none = api_base_url if api_base_url else None
+
+	if api_key_or_none:
 		if request.llm_provider == "browser_use":
-			os.environ["BROWSER_USE_API_KEY"] = api_key
+			os.environ["BROWSER_USE_API_KEY"] = api_key_or_none
 		elif request.llm_provider in ("openai", "9router", "custom"):
-			os.environ["OPENAI_API_KEY"] = api_key
+			os.environ["OPENAI_API_KEY"] = api_key_or_none
 		elif request.llm_provider == "google":
-			os.environ["GOOGLE_API_KEY"] = api_key
+			os.environ["GOOGLE_API_KEY"] = api_key_or_none
 		elif request.llm_provider == "anthropic":
-			os.environ["ANTHROPIC_API_KEY"] = api_key
+			os.environ["ANTHROPIC_API_KEY"] = api_key_or_none
 
 	try:
 		if tasks_db[task_id].get("status") == "cancelled":
@@ -380,24 +393,24 @@ async def execute_task_background(task_id: str, request: TaskRequest) -> None:
 		llm = None
 		provider = request.llm_provider.lower()
 
-		if provider in ("9router", "custom", "openai_compatible") or api_base_url:
+		if provider in ("9router", "custom", "openai_compatible") or api_base_url_or_none:
 			model = request.model_name or settings.get("default_model") or "gpt-4o"
 			llm = ChatOpenAI(
 				model=model,
-				base_url=api_base_url,
-				api_key=api_key or os.environ.get("OPENAI_API_KEY"),
+				base_url=api_base_url_or_none,
+				api_key=api_key_or_none,
 			)
 		elif provider == "browser_use":
 			llm = ChatBrowserUse()
 		elif provider == "openai":
 			model = request.model_name or "gpt-4.1-mini"
-			llm = ChatOpenAI(model=model, api_key=api_key)
+			llm = ChatOpenAI(model=model, api_key=api_key_or_none)
 		elif provider == "google":
 			model = request.model_name or "gemini-2.5-flash"
-			llm = ChatGoogle(model=model, api_key=api_key)
+			llm = ChatGoogle(model=model, api_key=api_key_or_none)
 		elif provider == "anthropic":
 			model = request.model_name or "claude-sonnet-4-0"
-			llm = ChatAnthropic(model=model, api_key=api_key)
+			llm = ChatAnthropic(model=model, api_key=api_key_or_none)
 		else:
 			llm = ChatBrowserUse()
 
@@ -560,15 +573,31 @@ async def update_settings_endpoint(req: SettingsUpdateRequest):
 
 @app.post("/api/v1/models", dependencies=[Depends(require_auth)], response_model=FetchModelsResponse, summary="Import models from 9router")
 async def fetch_models(request: FetchModelsRequest):
-	base_url = request.api_base_url.rstrip("/")
+	base_url = (request.api_base_url or "").strip().rstrip("/")
+	if not base_url:
+		settings = load_settings()
+		base_url = (settings.get("api_base_url") or "https://terbaik-9router.3obhmi.easypanel.host/v1").rstrip("/")
+
 	if not base_url.endswith("/models"):
 		url = f"{base_url}/models"
 	else:
 		url = base_url
 
+	api_key = (request.api_key or "").strip()
+	if not api_key:
+		settings = load_settings()
+		saved_keys = settings.get("api_keys", {})
+		api_key = (
+			saved_keys.get("9router")
+			or saved_keys.get("custom")
+			or saved_keys.get("openai")
+			or os.environ.get("OPENAI_API_KEY")
+			or ""
+		).strip()
+
 	headers = {}
-	if request.api_key:
-		headers["Authorization"] = f"Bearer {request.api_key}"
+	if api_key:
+		headers["Authorization"] = f"Bearer {api_key}"
 
 	try:
 		async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
