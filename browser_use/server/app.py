@@ -18,8 +18,15 @@ import os
 import secrets
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+
+# Timezone Definition for Asia/Jakarta (WIB = UTC+7)
+JAKARTA_TZ = timezone(timedelta(hours=7))
+
+def get_now_jakarta_iso() -> str:
+	"""Return current timestamp in ISO 8601 format for Asia/Jakarta timezone."""
+	return datetime.now(JAKARTA_TZ).isoformat()
 
 import httpx
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, Header, HTTPException, Request, Response, status
@@ -279,6 +286,10 @@ class SettingsUpdateRequest(BaseModel):
 	default_model: Optional[str] = None
 	auto_run_drafts: Optional[bool] = None
 	api_keys: Optional[Dict[str, str]] = None
+
+
+class BatchTaskRequest(BaseModel):
+	task_ids: List[str] = Field(..., description="List of task IDs for batch processing.")
 
 
 def filter_tasks_list(
@@ -682,7 +693,7 @@ async def fetch_models(request: FetchModelsRequest):
 @app.post("/api/v1/run", dependencies=[Depends(require_auth)], response_model=TaskResponse, summary="Submit a Task to Queue or Execute Immediately")
 async def run_task(request: TaskRequest):
 	task_id = str(uuid.uuid4())
-	created_at = datetime.now(timezone.utc).isoformat()
+	created_at = get_now_jakarta_iso()
 
 	if request.as_draft:
 		task_status = "draft"
@@ -741,13 +752,71 @@ async def export_tasks_json(
 	filtered = filter_tasks_list(all_tasks, start_date=start_date, end_date=end_date, status_filter=status)
 
 	content = json.dumps(filtered, ensure_ascii=False, indent=2)
-	filename = f"browser_use_logs_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.json"
+	filename = f"browser_use_logs_{datetime.now(JAKARTA_TZ).strftime('%Y%m%d_%H%M%S')}.json"
 
 	return Response(
 		content=content,
 		media_type="application/json",
 		headers={"Content-Disposition": f'attachment; filename="{filename}"'},
 	)
+
+
+@app.post("/api/v1/tasks/batch-delete", dependencies=[Depends(require_auth)], summary="Batch Delete Task Logs")
+async def batch_delete_tasks(req: BatchTaskRequest):
+	"""Batch delete multiple task logs permanently."""
+	deleted_count = 0
+	for task_id in req.task_ids:
+		if task_id in tasks_db:
+			del tasks_db[task_id]
+			file_path = os.path.join(LOGS_DIR, f"{task_id}.json")
+			if os.path.exists(file_path):
+				try:
+					os.remove(file_path)
+				except Exception:
+					pass
+			if task_id in active_task_handles:
+				active_task_handles[task_id].cancel()
+				del active_task_handles[task_id]
+			deleted_count += 1
+	return {"message": f"Deleted {deleted_count} log(s).", "count": deleted_count}
+
+
+@app.post("/api/v1/tasks/batch-redraft", dependencies=[Depends(require_auth)], summary="Batch Redraft Task Logs")
+async def batch_redraft_tasks(req: BatchTaskRequest):
+	"""Batch create new draft task copies for multiple task logs."""
+	created_ids = []
+	for task_id in req.task_ids:
+		if task_id in tasks_db:
+			original_task = tasks_db[task_id]
+			new_task_id = str(uuid.uuid4())
+			created_at = get_now_jakarta_iso()
+
+			new_task = {
+				"task_id": new_task_id,
+				"task": original_task.get("task", ""),
+				"status": "draft",
+				"created_at": created_at,
+				"completed_at": None,
+				"result": None,
+				"errors": [],
+				"urls_visited": [],
+				"steps_completed": 0,
+				"request": original_task.get("request", {
+					"task": original_task.get("task", ""),
+					"llm_provider": original_task.get("llm_provider", "9router"),
+					"model_name": original_task.get("model_name"),
+					"api_key": original_task.get("api_key"),
+					"api_base_url": original_task.get("api_base_url"),
+					"use_cloud": original_task.get("use_cloud", False),
+					"headless": True,
+				}),
+			}
+			tasks_db[new_task_id] = new_task
+			save_task_to_disk(new_task)
+			created_ids.append(new_task_id)
+
+	process_next_draft_job()
+	return {"message": f"Created {len(created_ids)} redrafted task(s).", "task_ids": created_ids}
 
 
 @app.post("/api/v1/tasks/{task_id}/stop", dependencies=[Depends(require_auth)], summary="Stop/Cancel a Running Task")
@@ -757,7 +826,7 @@ async def stop_task(task_id: str):
 		raise HTTPException(status_code=404, detail="Task ID not found")
 
 	tasks_db[task_id]["status"] = "cancelled"
-	tasks_db[task_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+	tasks_db[task_id]["completed_at"] = get_now_jakarta_iso()
 	tasks_db[task_id]["result"] = "Task stopped by user."
 	save_task_to_disk(tasks_db[task_id])
 
@@ -805,7 +874,7 @@ async def redraft_task(task_id: str):
 
 	original_task = tasks_db[task_id]
 	new_task_id = str(uuid.uuid4())
-	created_at = datetime.now(timezone.utc).isoformat()
+	created_at = get_now_jakarta_iso()
 
 	new_task = {
 		"task_id": new_task_id,
@@ -835,6 +904,27 @@ async def redraft_task(task_id: str):
 	process_next_draft_job()
 
 	return {"message": "Redrafted task created successfully.", "task_id": new_task_id, "status": "draft"}
+
+
+@app.delete("/api/v1/tasks/{task_id}", dependencies=[Depends(require_auth)], summary="Delete a Single Task Log")
+async def delete_task_log(task_id: str):
+	"""Delete a single task log permanently."""
+	if task_id not in tasks_db:
+		raise HTTPException(status_code=404, detail="Task ID not found")
+
+	del tasks_db[task_id]
+	file_path = os.path.join(LOGS_DIR, f"{task_id}.json")
+	if os.path.exists(file_path):
+		try:
+			os.remove(file_path)
+		except Exception:
+			pass
+
+	if task_id in active_task_handles:
+		active_task_handles[task_id].cancel()
+		del active_task_handles[task_id]
+
+	return {"message": f"Task {task_id} deleted successfully."}
 
 
 @app.get("/api/v1/tasks/{task_id}", dependencies=[Depends(require_auth)], response_model=TaskStatusResponse, summary="Get Task Status")
@@ -1025,12 +1115,24 @@ async def dashboard():
                             </div>
                         </div>
 
+                        <!-- Batch Actions Toolbar -->
+                        <div id="batchActionsBar" class="d-none alert alert-dark border-secondary p-2 mb-3 align-items-center justify-content-between">
+                            <div class="d-flex align-items-center gap-2">
+                                <span id="selectedCountText" class="fw-bold text-info small">0 item(s) selected</span>
+                            </div>
+                            <div class="d-flex align-items-center gap-2">
+                                <button class="btn btn-sm btn-danger py-1" onclick="batchDeleteLogs()">🗑️ Delete Selected</button>
+                                <button class="btn btn-sm btn-warning py-1 fw-semibold" onclick="batchRedraftLogs()">🔄 Redraft Selected</button>
+                            </div>
+                        </div>
+
                         <div class="table-responsive">
                             <table class="table table-dark table-hover align-middle mb-0">
                                 <thead>
                                     <tr>
+                                        <th style="width: 38px;"><input type="checkbox" id="selectAllCheck" class="form-check-input" onchange="toggleSelectAll(this.checked)"></th>
                                         <th>Task ID</th>
-                                        <th>Date & Time</th>
+                                        <th>Date & Time (WIB)</th>
                                         <th>Status</th>
                                         <th>Steps</th>
                                         <th>Result / Details</th>
@@ -1039,10 +1141,24 @@ async def dashboard():
                                 </thead>
                                 <tbody id="logsTableBody">
                                     <tr>
-                                        <td colspan="6" class="text-center text-secondary py-4">Loading job queue & logs...</td>
+                                        <td colspan="7" class="text-center text-secondary py-4">Loading job queue & logs...</td>
                                     </tr>
                                 </tbody>
                             </table>
+                        </div>
+
+                        <!-- Pagination Controls (100 items per page) -->
+                        <div class="d-flex flex-wrap align-items-center justify-content-between mt-3 pt-3 border-top border-secondary gap-2">
+                            <div class="small text-secondary" id="paginationInfo">Showing 0 of 0 logs</div>
+                            <nav id="paginationControls">
+                                <ul class="pagination pagination-sm mb-0">
+                                    <li class="page-item" id="btnPageFirst"><button class="page-link bg-dark text-light border-secondary" onclick="goToPage(1)">⏮️ First</button></li>
+                                    <li class="page-item" id="btnPagePrev"><button class="page-link bg-dark text-light border-secondary" onclick="changePage(-1)">◀️ Prev</button></li>
+                                    <li class="page-item disabled"><span class="page-link bg-dark text-info border-secondary" id="currentPageText">Page 1 of 1</span></li>
+                                    <li class="page-item" id="btnPageNext"><button class="page-link bg-dark text-light border-secondary" onclick="changePage(1)">Next ▶️</button></li>
+                                    <li class="page-item" id="btnPageLast"><button class="page-link bg-dark text-light border-secondary" onclick="goToLastPage()">Last ⏭️</button></li>
+                                </ul>
+                            </nav>
                         </div>
                     </div>
                 </div>
@@ -1560,6 +1676,29 @@ async def dashboard():
             }
         }
 
+        let currentPage = 1;
+        const pageSize = 100;
+
+        function formatDateWIB(isoStr) {
+            if (!isoStr) return '-';
+            try {
+                const d = new Date(isoStr);
+                if (isNaN(d.getTime())) return isoStr.replace('T', ' ').substring(0, 19);
+                return d.toLocaleString('id-ID', {
+                    timeZone: 'Asia/Jakarta',
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    hour12: false
+                }).replace(/\\./g, ':');
+            } catch (e) {
+                return isoStr.replace('T', ' ').substring(0, 19);
+            }
+        }
+
         async function loadLogsTable() {
             const startDate = document.getElementById('filterStartDate').value;
             const endDate = document.getElementById('filterEndDate').value;
@@ -1578,35 +1717,86 @@ async def dashboard():
                     headers: { 'Authorization': 'Bearer ' + sessionToken }
                 });
                 const data = await res.json();
-                currentLogsData = data;
-                renderLogsTable(data);
+                currentLogsData = data || [];
+                currentPage = 1;
+                renderLogsTable();
             } catch (err) {
-                document.getElementById('logsTableBody').innerHTML = `<tr><td colspan="6" class="text-danger text-center">Failed to load logs: ${err.message}</td></tr>`;
+                document.getElementById('logsTableBody').innerHTML = `<tr><td colspan="7" class="text-danger text-center">Failed to load logs: ${err.message}</td></tr>`;
             }
         }
 
-        function renderLogsTable(logs) {
+        function toggleSelectAll(checked) {
+            document.querySelectorAll('.log-select-check').forEach(cb => {
+                cb.checked = checked;
+            });
+            updateBatchToolbar();
+        }
+
+        function updateBatchToolbar() {
+            const selected = Array.from(document.querySelectorAll('.log-select-check:checked')).map(cb => cb.value);
+            const bar = document.getElementById('batchActionsBar');
+            const countText = document.getElementById('selectedCountText');
+            const selectAllCb = document.getElementById('selectAllCheck');
+
+            const allChecks = document.querySelectorAll('.log-select-check');
+            if (allChecks.length > 0 && selected.length === allChecks.length) {
+                if (selectAllCb) { selectAllCb.checked = true; selectAllCb.indeterminate = false; }
+            } else if (selected.length > 0) {
+                if (selectAllCb) { selectAllCb.checked = false; selectAllCb.indeterminate = true; }
+            } else {
+                if (selectAllCb) { selectAllCb.checked = false; selectAllCb.indeterminate = false; }
+            }
+
+            if (selected.length > 0) {
+                bar.classList.remove('d-none');
+                bar.classList.add('d-flex');
+                countText.textContent = `${selected.length} log(s) selected`;
+            } else {
+                bar.classList.add('d-none');
+                bar.classList.remove('d-flex');
+            }
+        }
+
+        function renderLogsTable() {
             const tbody = document.getElementById('logsTableBody');
             tbody.innerHTML = '';
 
-            if (!logs || logs.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="6" class="text-center text-secondary py-4">No matching job queue logs found.</td></tr>';
+            const selectAllCb = document.getElementById('selectAllCheck');
+            if (selectAllCb) {
+                selectAllCb.checked = false;
+                selectAllCb.indeterminate = false;
+            }
+            updateBatchToolbar();
+
+            if (!currentLogsData || currentLogsData.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="7" class="text-center text-secondary py-4">No matching job queue logs found.</td></tr>';
+                updatePaginationUI(0, 0, 1, 1, 0);
                 return;
             }
 
-            logs.forEach(log => {
+            const totalItems = currentLogsData.length;
+            const totalPages = Math.ceil(totalItems / pageSize) || 1;
+            if (currentPage > totalPages) currentPage = totalPages;
+            if (currentPage < 1) currentPage = 1;
+
+            const startIndex = (currentPage - 1) * pageSize;
+            const endIndex = Math.min(startIndex + pageSize, totalItems);
+            const pageLogs = currentLogsData.slice(startIndex, endIndex);
+
+            pageLogs.forEach(log => {
                 let badgeClass = 'badge-draft';
                 if (log.status === 'running') badgeClass = 'badge-running';
                 if (log.status === 'complete') badgeClass = 'badge-complete';
                 if (log.status === 'cancelled') badgeClass = 'badge-cancelled';
                 if (log.status === 'failed') badgeClass = 'badge-failed';
 
-                const formattedDate = log.created_at ? log.created_at.replace('T', ' ').substring(0, 19) : '-';
+                const formattedDate = formatDateWIB(log.created_at);
                 const resultSnippet = log.result ? log.result.substring(0, 80) + (log.result.length > 80 ? '...' : '') : (log.status === 'running' ? 'Executing in browser...' : (log.status === 'draft' ? 'Queued in Draft' : '-'));
 
                 let actionButtons = `
                     <button class="btn btn-sm btn-outline-info me-1" onclick="viewLogDetail('${log.task_id}')">View</button>
                     <button class="btn btn-sm btn-outline-warning me-1" onclick="redraftTask('${log.task_id}')">🔄 Redraft</button>
+                    <button class="btn btn-sm btn-outline-danger me-1" onclick="deleteSingleTask('${log.task_id}')">🗑️ Delete</button>
                 `;
                 
                 if (log.status === 'running') {
@@ -1617,6 +1807,7 @@ async def dashboard():
 
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
+                    <td><input type="checkbox" class="form-check-input log-select-check" value="${log.task_id}" onchange="updateBatchToolbar()"></td>
                     <td><code>${log.task_id.substring(0, 8)}...</code></td>
                     <td class="small text-secondary">${formattedDate}</td>
                     <td><span class="badge ${badgeClass}">${(log.status || 'unknown').toUpperCase()}</span></td>
@@ -1626,6 +1817,120 @@ async def dashboard():
                 `;
                 tbody.appendChild(tr);
             });
+
+            updatePaginationUI(startIndex + 1, endIndex, currentPage, totalPages, totalItems);
+        }
+
+        function updatePaginationUI(start, end, page, totalPages, totalItems) {
+            const info = document.getElementById('paginationInfo');
+            const currentText = document.getElementById('currentPageText');
+            const btnPrev = document.getElementById('btnPagePrev');
+            const btnNext = document.getElementById('btnPageNext');
+            const btnFirst = document.getElementById('btnPageFirst');
+            const btnLast = document.getElementById('btnPageLast');
+
+            if (!totalItems || totalItems === 0) {
+                if (info) info.textContent = 'Showing 0 of 0 logs';
+                if (currentText) currentText.textContent = 'Page 1 of 1';
+                if (btnPrev) btnPrev.classList.add('disabled');
+                if (btnNext) btnNext.classList.add('disabled');
+                if (btnFirst) btnFirst.classList.add('disabled');
+                if (btnLast) btnLast.classList.add('disabled');
+                return;
+            }
+
+            if (info) info.textContent = `Showing ${start} - ${end} of ${totalItems} logs`;
+            if (currentText) currentText.textContent = `Page ${page} of ${totalPages}`;
+
+            if (page <= 1) {
+                if (btnPrev) btnPrev.classList.add('disabled');
+                if (btnFirst) btnFirst.classList.add('disabled');
+            } else {
+                if (btnPrev) btnPrev.classList.remove('disabled');
+                if (btnFirst) btnFirst.classList.remove('disabled');
+            }
+
+            if (page >= totalPages) {
+                if (btnNext) btnNext.classList.add('disabled');
+                if (btnLast) btnLast.classList.add('disabled');
+            } else {
+                if (btnNext) btnNext.classList.remove('disabled');
+                if (btnLast) btnLast.classList.remove('disabled');
+            }
+        }
+
+        function changePage(delta) {
+            currentPage += delta;
+            renderLogsTable();
+        }
+
+        function goToPage(page) {
+            currentPage = page;
+            renderLogsTable();
+        }
+
+        function goToLastPage() {
+            const totalPages = Math.ceil(currentLogsData.length / pageSize) || 1;
+            currentPage = totalPages;
+            renderLogsTable();
+        }
+
+        async function deleteSingleTask(taskId) {
+            if (!confirm(`Are you sure you want to delete log ${taskId.substring(0, 8)}...?`)) return;
+            try {
+                const res = await fetch(`/api/v1/tasks/${taskId}`, {
+                    method: 'DELETE',
+                    headers: { 'Authorization': 'Bearer ' + sessionToken }
+                });
+                if (!res.ok) throw new Error('Failed to delete task');
+                loadLogsTable();
+            } catch (err) {
+                alert('Delete failed: ' + err.message);
+            }
+        }
+
+        async function batchDeleteLogs() {
+            const selectedIds = Array.from(document.querySelectorAll('.log-select-check:checked')).map(cb => cb.value);
+            if (selectedIds.length === 0) return;
+
+            if (!confirm(`Are you sure you want to delete ${selectedIds.length} selected log(s)? This action cannot be undone.`)) return;
+
+            try {
+                const res = await fetch('/api/v1/tasks/batch-delete', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + sessionToken
+                    },
+                    body: JSON.stringify({ task_ids: selectedIds })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Batch delete failed');
+                loadLogsTable();
+            } catch (err) {
+                alert('Batch delete failed: ' + err.message);
+            }
+        }
+
+        async function batchRedraftLogs() {
+            const selectedIds = Array.from(document.querySelectorAll('.log-select-check:checked')).map(cb => cb.value);
+            if (selectedIds.length === 0) return;
+
+            try {
+                const res = await fetch('/api/v1/tasks/batch-redraft', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer ' + sessionToken
+                    },
+                    body: JSON.stringify({ task_ids: selectedIds })
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.detail || 'Batch redraft failed');
+                loadLogsTable();
+            } catch (err) {
+                alert('Batch redraft failed: ' + err.message);
+            }
         }
 
         async function redraftTask(taskId) {
