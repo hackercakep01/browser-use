@@ -340,17 +340,32 @@ def process_next_draft_job() -> None:
 	next_job = draft_jobs[0]
 	task_id = next_job["task_id"]
 
-	req_dict = next_job.get("request", {})
+	active_provider = settings.get("default_provider", "9router")
+	active_model = settings.get("default_model", "gpt-4o")
+	active_api_base_url = settings.get("api_base_url")
+
+	req_dict = dict(next_job.get("request", {}))
 	if not req_dict:
 		req_dict = {
 			"task": next_job.get("task", ""),
-			"llm_provider": next_job.get("llm_provider", "9router"),
-			"model_name": next_job.get("model_name"),
-			"api_key": next_job.get("api_key"),
-			"api_base_url": next_job.get("api_base_url"),
 			"use_cloud": next_job.get("use_cloud", False),
 			"headless": True,
 		}
+
+	# Override provider & model with currently active / saved settings
+	req_dict["llm_provider"] = active_provider
+	req_dict["model_name"] = active_model
+	if active_provider in ("9router", "custom"):
+		req_dict["api_base_url"] = active_api_base_url
+	else:
+		req_dict["api_base_url"] = None
+
+	saved_key = (settings.get("api_keys", {}) or {}).get(active_provider)
+	if saved_key:
+		req_dict["api_key"] = saved_key
+
+	next_job["request"] = req_dict
+	save_task_to_disk(next_job)
 
 	task_req = TaskRequest(**req_dict)
 	task_handle = asyncio.create_task(execute_task_background(task_id, task_req))
@@ -785,11 +800,29 @@ async def batch_delete_tasks(req: BatchTaskRequest):
 async def batch_redraft_tasks(req: BatchTaskRequest):
 	"""Batch create new draft task copies for multiple task logs."""
 	created_ids = []
+	settings = load_settings()
+	active_provider = settings.get("default_provider", "9router")
+	active_model = settings.get("default_model", "gpt-4o")
+	active_api_base_url = settings.get("api_base_url")
+	saved_keys = settings.get("api_keys", {}) or {}
+	active_api_key = saved_keys.get(active_provider)
+
 	for task_id in req.task_ids:
 		if task_id in tasks_db:
 			original_task = tasks_db[task_id]
 			new_task_id = str(uuid.uuid4())
 			created_at = get_now_jakarta_iso()
+			orig_req = original_task.get("request", {})
+
+			new_req = {
+				"task": original_task.get("task", ""),
+				"llm_provider": active_provider,
+				"model_name": active_model,
+				"api_key": active_api_key or orig_req.get("api_key"),
+				"api_base_url": active_api_base_url if active_provider in ("9router", "custom") else None,
+				"use_cloud": orig_req.get("use_cloud", False),
+				"headless": True,
+			}
 
 			new_task = {
 				"task_id": new_task_id,
@@ -801,15 +834,7 @@ async def batch_redraft_tasks(req: BatchTaskRequest):
 				"errors": [],
 				"urls_visited": [],
 				"steps_completed": 0,
-				"request": original_task.get("request", {
-					"task": original_task.get("task", ""),
-					"llm_provider": original_task.get("llm_provider", "9router"),
-					"model_name": original_task.get("model_name"),
-					"api_key": original_task.get("api_key"),
-					"api_base_url": original_task.get("api_base_url"),
-					"use_cloud": original_task.get("use_cloud", False),
-					"headless": True,
-				}),
+				"request": new_req,
 			}
 			tasks_db[new_task_id] = new_task
 			save_task_to_disk(new_task)
@@ -846,18 +871,33 @@ async def launch_draft_task(task_id: str):
 	if task_id not in tasks_db:
 		raise HTTPException(status_code=404, detail="Task ID not found")
 
+	settings = load_settings()
+	active_provider = settings.get("default_provider", "9router")
+	active_model = settings.get("default_model", "gpt-4o")
+	active_api_base_url = settings.get("api_base_url")
+
 	task_data = tasks_db[task_id]
-	req_dict = task_data.get("request", {})
+	req_dict = dict(task_data.get("request", {}))
 	if not req_dict:
 		req_dict = {
 			"task": task_data.get("task", ""),
-			"llm_provider": task_data.get("llm_provider", "9router"),
-			"model_name": task_data.get("model_name"),
-			"api_key": task_data.get("api_key"),
-			"api_base_url": task_data.get("api_base_url"),
 			"use_cloud": task_data.get("use_cloud", False),
 			"headless": True,
 		}
+
+	req_dict["llm_provider"] = active_provider
+	req_dict["model_name"] = active_model
+	if active_provider in ("9router", "custom"):
+		req_dict["api_base_url"] = active_api_base_url
+	else:
+		req_dict["api_base_url"] = None
+
+	saved_key = (settings.get("api_keys", {}) or {}).get(active_provider)
+	if saved_key:
+		req_dict["api_key"] = saved_key
+
+	task_data["request"] = req_dict
+	save_task_to_disk(task_data)
 
 	task_req = TaskRequest(**req_dict)
 	task_handle = asyncio.create_task(execute_task_background(task_id, task_req))
@@ -876,6 +916,24 @@ async def redraft_task(task_id: str):
 	new_task_id = str(uuid.uuid4())
 	created_at = get_now_jakarta_iso()
 
+	settings = load_settings()
+	active_provider = settings.get("default_provider", "9router")
+	active_model = settings.get("default_model", "gpt-4o")
+	active_api_base_url = settings.get("api_base_url")
+	saved_keys = settings.get("api_keys", {}) or {}
+	active_api_key = saved_keys.get(active_provider)
+	orig_req = original_task.get("request", {})
+
+	new_req = {
+		"task": original_task.get("task", ""),
+		"llm_provider": active_provider,
+		"model_name": active_model,
+		"api_key": active_api_key or orig_req.get("api_key"),
+		"api_base_url": active_api_base_url if active_provider in ("9router", "custom") else None,
+		"use_cloud": orig_req.get("use_cloud", False),
+		"headless": True,
+	}
+
 	new_task = {
 		"task_id": new_task_id,
 		"task": original_task.get("task", ""),
@@ -886,15 +944,7 @@ async def redraft_task(task_id: str):
 		"errors": [],
 		"urls_visited": [],
 		"steps_completed": 0,
-		"request": original_task.get("request", {
-			"task": original_task.get("task", ""),
-			"llm_provider": original_task.get("llm_provider", "9router"),
-			"model_name": original_task.get("model_name"),
-			"api_key": original_task.get("api_key"),
-			"api_base_url": original_task.get("api_base_url"),
-			"use_cloud": original_task.get("use_cloud", False),
-			"headless": True,
-		}),
+		"request": new_req,
 	}
 
 	tasks_db[new_task_id] = new_task
